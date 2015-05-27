@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Physics Body Editor
+GenericName=Physics Body Editor
+Exec=physics-body-editor %U
+Terminal=false
+Icon=java
+Type=Application
+Categories=Developer

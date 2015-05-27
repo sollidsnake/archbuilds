@@ -1,0 +1,30 @@
+# Maintainer: Your Name <youremail@domain.com>
+_pkgbasename=file-roller
+pkgname=file-roller-ubuntu
+pkgver=2.30.0
+pkgrel=1
+pkgdesc="Ubuntu version of GNOME file-roller"
+arch=('any')
+url="http://packages.ubuntu.com/lucid/file-roller"
+license=('GPL')
+depends=('desktop-file-utils'  'gtk3'  'hicolor-icon-theme'
+         'dconf'  'libarchive'  'file'
+         'json-glib'  'libnotify'  'p7zip')
+provides=('file-roller')
+conflicts=('file-roller')
+replaces=('file-roller')
+source=(http://archive.ubuntu.com/ubuntu/pool/main/f/file-roller/{$_pkgbasename}_$pkgver.orig.tar.gz)
+md5sums=('65d92cbd793cf04853011916b6cd2bd0')
+
+build() {
+  cd "$srcdir/$_pkgbasename-$pkgver"
+
+  ./configure --prefix=/usr
+  make
+}
+
+package() {
+  cd "$srcdir/$_pkgbasename-$pkgver"
+
+  make DESTDIR="$pkgdir/" install
+}

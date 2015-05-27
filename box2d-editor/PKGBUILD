@@ -1,0 +1,51 @@
+# Maintainer: Jesse Nazario <jessenzr@gmail.com>
+
+_pkgbasename=box2d-editor
+pkgname=$_pkgbasename-git
+pkgrel=1
+pkgdesc=""
+arch=('i686' 'x86_64')
+url="http://www.aurelienribon.com/blog/projects/physics-body-editor/"
+license=('apache2')
+depends=('java-environment')
+source=("git+https://github.com/sollidsnake/box2d-editor"
+        'physics-body-editor'
+        'physics-body-editor.desktop'
+        'gdx-body-loader.desktop'
+        'gdx-body-loader'
+)
+md5sums=('SKIP'
+         '78fa2570113d39cab871899f263f3f05'
+         '9a5a4a840594e3ba2d6a9bf81f7a1db4'
+         '23ec8d4dc7309ef9702cfde7863fee9f'
+         'b7ae084dae2482cbfbed9d761fba15f2')
+
+build() {
+    cd $srcdir/box2d-editor
+    ant all
+}
+
+package() {
+    mkdir -p "$pkgdir/usr/share/java/box2d-editor/"
+    mkdir -p "$pkgdir/usr/share/applications/"
+    mkdir -p "$pkgdir/usr/bin"
+    mkdir -p "$pkgdir/usr/share/java/"
+
+    install -Dm644 "$srcdir/$_pkgbasename/editor/physics-body-editor.jar" "$pkgdir/usr/share/java/box2d-editor/"
+    install -Dm644 "$srcdir/physics-body-editor.desktop" "$pkgdir/usr/share/applications/"
+    install -Dm7557 "$srcdir/physics-body-editor" "$pkgdir/usr/bin"
+
+    install -Dm644 "$srcdir/$_pkgbasename/loader-libgdx/bodyeditor-loader.jar" "$pkgdir/usr/share/java/box2d-editor/"
+    #install -Dm644 "$srcdir/gdx-body-loader.desktop" "$pkgdir/usr/share/applications/"
+    #install -Dm7557 "$srcdir/gdx-body-loader" "$pkgdir/usr/bin"
+
+    cp -r "$srcdir/box2d-editor/" "$pkgdir/usr/share/java/"
+    chmod -R 755 "$pkgdir/usr/share/java/box2d-editor"
+}
+
+pkgver() {
+    cd "$_pkgbasename"
+    git describe --long | sed 's/\([^-]*-g\)/r\1/;s/-/./g'
+}
+
+# vim:syntax=sh

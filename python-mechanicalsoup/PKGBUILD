@@ -1,0 +1,26 @@
+# Maintainer: Massimiliano Torromeo <massimiliano.torromeo@gmail.com>
+
+pkgbase=MechanicalSoup
+pkgname=python-mechanicalsoup
+pkgver=0.2.1
+pkgrel=1
+pkgdesc="A Python library for automating interaction with websites"
+arch=(any)
+url="http://www.pymysql.org/"
+license=('MIT')
+depends=('python')
+makedepends=('python-setuptools')
+source=("https://github.com/hickford/MechanicalSoup/archive/v0.2.1.zip")
+
+build() {
+    cd "$srcdir/$pkgbase-$pkgver"
+    python setup.py build
+}
+
+package() {
+    cd "$srcdir/$pkgbase-$pkgver"
+    python setup.py install -O1 --skip-build --root="$pkgdir"
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+sha256sums=('690cadc030693862a164b7164ffd60ec369e04bb39f7144738b1b435e33da62e')

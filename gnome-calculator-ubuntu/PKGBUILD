@@ -1,0 +1,28 @@
+# Maintainer: Your Name <youremail@domain.com>
+_pkgbasename=gnome-calculator
+pkgname=${_pkgbasename}-ubuntu
+pkgver=3.14.1
+pkgrel=1
+pkgdesc="Gnome calculator. Ubuntu version"
+arch=('any')
+url="http://packages.ubuntu.com/utopic/gnome-calculator"
+license=('GPL')
+groups=()
+depends=('gnome-desktop')
+provides=($_pkgbasename)
+conflicts=($_pkgbasename)
+source=(http://archive.ubuntu.com/ubuntu/pool/main/g/${_pkgbasename}/${_pkgbasename}_${pkgver}.orig.tar.xz)
+md5sums=('3b41843f1452f4d79896c322392fe423')
+
+build() {
+    cd "$srcdir/$_pkgbasename-$pkgver"
+
+    ./configure --prefix=/usr
+    make
+}
+
+package() {
+    cd "$srcdir/$_pkgbasename-$pkgver"
+
+    make DESTDIR="$pkgdir/" install
+}

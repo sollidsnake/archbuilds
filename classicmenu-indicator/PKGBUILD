@@ -1,0 +1,24 @@
+# Maintainer: Your Name <youremail@domain.com>
+pkgname=classicmenu-indicator
+pkgver=0.09
+pkgrel=1
+pkgdesc="Classic menu indicator"
+arch=('any')
+url="http://www.florian-diesch.de/software/classicmenu-indicator"
+license=('GPL')
+depends=('gnome-menus2' 'python2')
+source=($url/dist/$pkgname-$pkgver.tar.gz)
+md5sums=('b75caec77d7b8a0c728fefa52ab79c8c')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+
+  python2 setup.py install --root=$pkgdir
+  mkdir $pkgdir/usr/share/pixmaps/
+  ln -s $pkgdir/usr/share/icons/ubuntu-mono-light/status/24/classicmenu-indicator.svg $pkgdir/usr/share/pixmaps/
+}

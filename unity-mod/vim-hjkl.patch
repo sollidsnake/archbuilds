@@ -1,0 +1,12 @@
+486a487,488
+>       case NUX_VK_K:
+>       case NUX_VK_k:
+489a492,493
+>       case NUX_VK_L:
+>       case NUX_VK_l:
+492a497,498
+>       case NUX_VK_H:
+>       case NUX_VK_h:
+495a502,503
+>       case NUX_VK_J:
+>       case NUX_VK_j:

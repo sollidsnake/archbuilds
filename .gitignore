@@ -3,3 +3,6 @@
 *.tar.gz
 *.tar.xz
 *.zip
+*.bz2
+*.png
+/*/*/

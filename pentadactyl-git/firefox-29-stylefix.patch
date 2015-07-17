@@ -1,0 +1,24 @@
+--- src/pentadactyl/common/skin/dactyl.css	2014-09-08 09:19:14.185037301 -0300
++++ common/skin/dactyl.css	2014-09-08 08:53:40.711614754 -0300
+@@ -170,8 +170,8 @@
+ 
+ #brower-bottombox > #addon-bar .toolbarbutton-1 > xul|dropmarker,
+ #dactyl-addon-bar .toolbarbutton-1 > xul|dropmarker {
+-    margin-left: 0 !important;
+-    margin-right: 0 !important;
++    /* margin-left: 0 !important; */
++    /* margin-right: 0 !important; */
+ }
+ 
+ #dactyl-addon-bar .toolbarbutton-1 > xul|dropmarker::after {
+@@ -252,8 +252,8 @@
+ }
+ 
+ #nav-bar-customization-target > .toolbarbutton-1 {
+-    margin-top: -5px !important;
+-    margin-bottom: -5px !important;
++    /* margin-top: -5px !important; */
++    /* margin-bottom: -5px !important; */
+ }
+ 
+ /*

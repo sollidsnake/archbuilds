@@ -11,14 +11,12 @@ depends=('java-environment')
 source=("git+https://github.com/sollidsnake/box2d-editor"
         'physics-body-editor'
         'physics-body-editor.desktop'
-        'gdx-body-loader.desktop'
-        'gdx-body-loader'
+        #'gdx-body-loader.desktop'
+        #'gdx-body-loader'
 )
 md5sums=('SKIP'
          '78fa2570113d39cab871899f263f3f05'
-         '9a5a4a840594e3ba2d6a9bf81f7a1db4'
-         '23ec8d4dc7309ef9702cfde7863fee9f'
-         'b7ae084dae2482cbfbed9d761fba15f2')
+         '9a5a4a840594e3ba2d6a9bf81f7a1db4')
 
 build() {
     cd $srcdir/box2d-editor

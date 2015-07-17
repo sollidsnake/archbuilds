@@ -1,0 +1,47 @@
+# $Id: PKGBUILD 239177 2015-05-12 15:03:07Z arojas $
+# Maintainer: Felix Yan <felixonmars@archlinux.org>
+# Contributor: Andrea Scarpino <andrea@archlinux.org>
+
+pkgname=kcalc
+pkgver=15.04.1
+pkgrel=1
+pkgdesc='Scientific Calculator'
+url='http://kde.org/applications/utilities/kcalc/'
+arch=('i686' 'x86_64')
+license=('GPL' 'LGPL' 'FDL')
+depends=('kinit')
+makedepends=('extra-cmake-modules' 'python' 'kdoctools')
+conflicts=('kdeutils-kcalc')
+replaces=('kdeutils-kcalc')
+groups=('kde-applications' 'kdeutils')
+install=${pkgname}.install
+source=("http://download.kde.org/stable/applications/${pkgver}/src/kcalc-${pkgver}.tar.xz"
+       "hide-menu.patch")
+sha1sums=('7c4fd090c0763518b190d8bb3885c61f0e1415df'
+          'a43d87531ec57c6ad168b885b06848bcdec74154')
+
+prepare() {
+  mkdir -p build
+}
+
+build() {
+  
+  cd build
+  cmake ../kcalc-${pkgver} \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTING=OFF \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DKDE_INSTALL_USE_QT_SYS_PATHS=ON
+
+  cd ..
+  patch -p0 -i "$srcdir/hide-menu.patch"
+  cd build
+  
+  make
+}
+
+package() {
+  cd build
+  make DESTDIR="$pkgdir" install
+}

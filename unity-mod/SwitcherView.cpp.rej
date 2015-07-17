@@ -1,0 +1,22 @@
+--- SwitcherView.cpp	2014-04-16 19:40:48.000000000 -0300
++++ SwitcherView.cpp	2014-04-22 21:31:01.892448398 -0300
+@@ -454,15 +454,19 @@
+   {
+     switch(keysym)
+     {
++      case NUX_VK_k:
+       case NUX_VK_UP:
+         switcher_stop_detail.emit();
+         break;
++      case NUX_VK_l:
+       case NUX_VK_RIGHT:
+         switcher_next.emit();
+         break;
++      case NUX_VK_h:
+       case NUX_VK_LEFT:
+         switcher_prev.emit();
+         break;
++      case NUX_VK_j:
+       case NUX_VK_DOWN:
+         switcher_start_detail.emit();
+         break;

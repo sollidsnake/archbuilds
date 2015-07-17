@@ -1,0 +1,15 @@
+Only in kcalc-15.04.1.new: #kcalc.cpp#
+diff -aur kcalc-15.04.1/kcalc.cpp kcalc-15.04.1.new/kcalc.cpp
+--- kcalc-15.04.1/kcalc.cpp	2015-04-13 16:35:01.000000000 -0300
++++ kcalc-15.04.1.new/kcalc.cpp	2015-05-27 12:43:11.193846225 -0300
+@@ -150,6 +150,10 @@
+ 	setBase();
+ 
+ 	calc_display->setFocus();
++
++	QString menuProxy = QString(qgetenv("UBUNTU_MENUPROXY"));
++	if(menuProxy == "1")
++	    menuBar()->hide();
+ }
+ 
+ //------------------------------------------------------------------------------

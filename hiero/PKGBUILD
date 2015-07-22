@@ -1,0 +1,27 @@
+# Maintainer: Jesse Nazario <jessenzr@gmail.com>
+pkgname=hiero
+pkgver=1.0
+pkgrel=1
+pkgdesc="Bitmap font generator compatible with libgdx."
+arch=('any')
+url="https://code.google.com/p/libgdx/downloads/detail?name=hiero.jar&can=2&q="
+license=('apache2')
+depends=('java-environment')
+source=("https://libgdx.googlecode.com/files/hiero.jar"
+        "hiero"
+        "hiero.desktop")
+md5sums=('0ccb00c868cab9f43eb400881cae03f1'
+         '9dbd188007c937efb5352a56849b4494'
+         '37f8ea8d91b593109016a9645f98ff7c')
+
+package() {
+  cd $srcdir
+
+  chmod +x $pkgname
+  mkdir -p $pkgdir/usr/{share/java/$pkgname/,bin,share/pixmaps,share/applications}
+  install -Dm644 $pkgname.jar $pkgdir/usr/share/java/$pkgname/
+  # install -Dm644 features_hover.png $pkgdir/usr/share/pixmaps/gdx-setup.png
+  install -Dm644 hiero.desktop $pkgdir/usr/share/applications/
+  install -Dm7557 hiero $pkgdir/usr/bin
+  #make DESTDIR="$pkgdir/" install
+}

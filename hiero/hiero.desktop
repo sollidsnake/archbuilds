@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=Hiero
+GenericName=Hiero
+Exec=hiero %U
+Terminal=false
+Icon=gdx-setup
+Type=Application
+Categories=Development;

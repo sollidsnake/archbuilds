@@ -1,0 +1,22 @@
+# Maintainer: Jesse Nazario <jessenzr@gmail.com>
+pkgname=byzanz-gui
+pkgver=1
+pkgrel=1
+pkgdesc="Bash script tools for byzanz"
+arch=('any')
+url="https://github.com/Fechin/bins"
+license=('GPL')
+depends=('bash' 'byzanz')
+source=("https://github.com/Fechin/bins/raw/master/byzanz-record-gui.sh"
+        "https://github.com/Fechin/bins/raw/master/byzanz-record-window.sh")
+md5sums=('5958a22c7dca4f598514054cc9126bdd'
+         '763491d48b0175b8a82c170adaf17746')
+
+package() {
+    cd "$srcdir"
+
+    mkdir -p $pkgdir/usr/bin
+    
+    install -Dm6447 byzanz-record-gui.sh $pkgdir/usr/bin/byzanz-record-gui
+    install -Dm6447 byzanz-record-window.sh $pkgdir/usr/bin/byzanz-record-window
+}

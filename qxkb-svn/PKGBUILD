@@ -1,0 +1,31 @@
+# Maintainer: Jesse Nazario <jessenzr@gmail.com>
+_pkgbasename=qxkb
+pkgname=$_pkgbasename-svn
+pkgver=1
+pkgrel=1
+pkgdesc="qxkb"
+arch=('x86' 'x86_64')
+url="https://github.com/disels/qxkb"
+license=('GPL')
+depends=('qt5-base' 'qt5-svg' 'qt5-x11extras' 'qt5-tools')
+provides=('qxkb')
+replaces=('qxkb')
+source=(svn+http://qxkb.googlecode.com/svn)
+noextract=()
+md5sums=('SKIP') #autofill with 'updpkgsums'
+
+build() {
+    cd "$srcdir/svn/trunk"
+    
+    mkdir -p build
+    cd build
+    cmake -DCMAKE_INSTALL_PREFIX:PATH=/usr ..
+    make
+}
+
+package() {
+    cd "$srcdir/svn/trunk/build"
+    
+    make DESTDIR="$pkgdir/" install
+}
+

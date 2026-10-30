@@ -1,0 +1,205 @@
+diff --color -ruN a/applets/appmenu/appmenuapplet.cpp b/applets/appmenu/appmenuapplet.cpp
+--- a/applets/appmenu/appmenuapplet.cpp	2026-10-27 08:32:06.000000000 -0300
++++ b/applets/appmenu/appmenuapplet.cpp	2026-10-30 14:03:32.765520432 -0300
+@@ -17,6 +17,8 @@
+ #include <QQuickWindow>
+ #include <QScreen>
+ #include <QTimer>
++#include <QtWaylandClient/private/qwaylanddisplay_p.h>
++#include <QtWaylandClient/private/qwaylandwindow_p.h>
+ 
+ int AppMenuApplet::s_refs = 0;
+ namespace
+@@ -144,6 +146,23 @@
+     setCurrentIndex(-1);
+ }
+ 
++// HACK Qt only creates grabbing popups once the process has received some input (for the seat and serial of the
++// grab). Right after plasmashell starts that may not have happened yet, so a menu opened from the keyboard would
++// fail until the panel is clicked. Same as AppMenuModule::ensureSerial() in the appmenu kded module.
++static void ensureInputSerial(QWindow *window)
++{
++    auto waylandWindow = dynamic_cast<QtWaylandClient::QWaylandWindow *>(window->handle());
++    if (!waylandWindow || waylandWindow->display()->lastInputDevice()) {
++        return;
++    }
++    QtWaylandClient::QWaylandDisplay *display = waylandWindow->display();
++#ifdef HAVE_QT_WAYLAND_SETLASTINPUTDEVICE_SURFACE
++    display->setLastInputDevice(display->currentInputDevice(), 1, waylandWindow->waylandSurface());
++#else
++    display->setLastInputDevice(display->currentInputDevice(), 1, waylandWindow);
++#endif
++}
++
+ Qt::Edges edgeFromLocation(Plasma::Types::Location location)
+ {
+     switch (location) {
+@@ -191,7 +210,17 @@
+ 
+         if (view() == FullView) {
+             if (!m_currentMenu) {
+-                m_currentMenu = new QMenu(qobject_cast<QWidget *>(actionMenu->parent()));
++                // Don't give the menu a QWidget parent: on show, QMenu replaces our transient parent with its
++                // native parent widget, which is the importer's never-shown root menu and has no Wayland surface.
++                // Qt then can only create the grabbing popup if the panel happened to get the last input event,
++                // so menus opened from the keyboard (shortcut, Alt mnemonics) fail after the first time.
++                m_currentMenu = new QMenu();
++                if (QObject *owner = actionMenu->parent()) {
++                    // keep the old lifetime: go away together with the importer's menu
++                    connect(owner, &QObject::destroyed, m_currentMenu, [menu = m_currentMenu.data()] {
++                        delete menu;
++                    });
++                }
+                 connect(m_currentMenu, &QMenu::aboutToHide, this, &AppMenuApplet::onMenuAboutToHide, Qt::UniqueConnection);
+             } else if (m_sourceMenu != actionMenu) {
+                 auto menuAction = m_currentMenu->menuAction();
+@@ -232,6 +261,8 @@
+         pos = QPoint(qBound(geo.x(), pos.x(), geo.x() + geo.width() - m_currentMenu->width()),
+                      qBound(geo.y(), pos.y(), geo.y() + geo.height() - m_currentMenu->height()));
+ 
++        ensureInputSerial(ctx->window());
++
+         if (view() == FullView) {
+             if (m_currentMenu->isVisible()) {
+                 m_currentMenu->move(pos);
+diff --color -ruN a/applets/appmenu/appmenumodel.cpp b/applets/appmenu/appmenumodel.cpp
+--- a/applets/appmenu/appmenumodel.cpp	2026-10-27 08:32:06.000000000 -0300
++++ b/applets/appmenu/appmenumodel.cpp	2026-10-30 14:03:32.765313835 -0300
+@@ -11,6 +11,7 @@
+ #include <QDBusConnectionInterface>
+ #include <QDBusServiceWatcher>
+ #include <QGuiApplication>
++#include <QKeyEvent>
+ #include <QMenu>
+ #include <QWindow>
+ 
+@@ -39,11 +40,18 @@
+     }
+ };
+ 
++namespace
++{
++// all global menu applets in this process, see handlesActivationRequests()
++QList<AppMenuModel *> s_models;
++}
++
+ AppMenuModel::AppMenuModel(QObject *parent)
+     : QAbstractListModel(parent)
+     , m_tasksModel(new TaskManager::TasksModel(this))
+     , m_serviceWatcher(new QDBusServiceWatcher(this))
+ {
++    s_models.append(this);
+     m_tasksModel->setFilterByScreen(!m_allScreens);
+     connect(m_tasksModel, &TaskManager::TasksModel::activeTaskChanged, this, &AppMenuModel::onActiveWindowChanged);
+     connect(m_tasksModel,
+@@ -116,7 +124,10 @@
+     }
+ }
+ 
+-AppMenuModel::~AppMenuModel() = default;
++AppMenuModel::~AppMenuModel()
++{
++    s_models.removeOne(this);
++}
+ 
+ bool AppMenuModel::menuAvailable() const
+ {
+@@ -204,6 +215,28 @@
+     }
+ }
+ 
++bool AppMenuModel::handlesActivationRequests() const
++{
++    // Every applet showing this window's menu (e.g. a panel on each screen, with menus for all screens enabled)
++    // receives the app's Alt+<mnemonic> request. If all of them open a grabbing popup, the later ones get nested
++    // into the first one and keyboard focus ends up in a menu on the wrong screen. So only one of them reacts:
++    // the one on the window's screen, or else the first one.
++    const QRect windowScreen = m_tasksModel->data(m_tasksModel->activeTask(), TaskManager::AbstractTasksModel::ScreenGeometry).toRect();
++    const AppMenuModel *handler = nullptr;
++    for (const AppMenuModel *model : std::as_const(s_models)) {
++        if (!model->m_menuAvailable || !model->m_menu || model->m_serviceName != m_serviceName || model->m_menuObjectPath != m_menuObjectPath) {
++            continue;
++        }
++        if (model->screenGeometry() == windowScreen) {
++            return model == this;
++        }
++        if (!handler) {
++            handler = model;
++        }
++    }
++    return handler == this;
++}
++
+ void AppMenuModel::update()
+ {
+     beginResetModel();
+@@ -253,6 +286,14 @@
+     if (watched == m_searchBar.get() && event->type() == QEvent::Show) {
+         m_searchBar->setFocus(Qt::PopupFocusReason);
+         m_searchBar->selectAll();
++    } else if (watched == m_searchBar.get() && event->type() == QEvent::KeyPress && m_searchBar->text().isEmpty()) {
++        // With nothing to move the cursor over, let Left/Right switch to the neighbouring menu like in the other
++        // menus: keep them from the search bar, the ignored event then propagates to the menu.
++        const int key = static_cast<QKeyEvent *>(event)->key();
++        if (key == Qt::Key_Left || key == Qt::Key_Right) {
++            event->ignore();
++            return true;
++        }
+     }
+     return QAbstractListModel::eventFilter(watched, event);
+ }
+@@ -361,7 +402,7 @@
+ 
+         connect(m_importer.get(), &DBusMenuImporter::actionActivationRequested, this, [this](QAction *action) {
+             // TODO submenus
+-            if (!m_menuAvailable || !m_menu) {
++            if (!m_menuAvailable || !m_menu || !handlesActivationRequests()) {
+                 return;
+             }
+ 
+diff --color -ruN a/applets/appmenu/appmenumodel.h b/applets/appmenu/appmenumodel.h
+--- a/applets/appmenu/appmenumodel.h	2026-10-27 08:32:06.000000000 -0300
++++ b/applets/appmenu/appmenumodel.h	2026-10-30 14:03:32.765282345 -0300
+@@ -99,6 +99,7 @@
+ 
+     void removeSearchActionsFromMenu();
+     void insertSearchActionsIntoMenu(const QString &filter = QString());
++    bool handlesActivationRequests() const;
+ 
+     QDBusServiceWatcher *m_serviceWatcher;
+     QString m_serviceName;
+diff --color -ruN a/applets/appmenu/CMakeLists.txt b/applets/appmenu/CMakeLists.txt
+--- a/applets/appmenu/CMakeLists.txt	2026-10-27 08:32:06.000000000 -0300
++++ b/applets/appmenu/CMakeLists.txt	2026-10-30 14:03:32.765491657 -0300
+@@ -19,6 +19,7 @@
+     Qt::Widgets
+     Qt::Quick
+     Qt::DBus
++    Qt::WaylandClientPrivate
+     Plasma::Plasma
+     KF6::WindowSystem
+     KF6::I18n
+@@ -26,6 +27,11 @@
+     dbusmenuqt
+ )
+ 
++# checked in appmenu/
++if (HAVE_QT_WAYLAND_SETLASTINPUTDEVICE_SURFACE)
++    target_compile_definitions(org.kde.plasma.appmenu PRIVATE HAVE_QT_WAYLAND_SETLASTINPUTDEVICE_SURFACE)
++endif()
++
+ add_test(NAME applet_appmenu_smoketest COMMAND plasmawindowed --smoke-test org.kde.plasma.appmenu)
+ set_tests_properties(applet_appmenu_smoketest PROPERTIES
+     ENVIRONMENT_MODIFICATION QT_PLUGIN_PATH=path_list_prepend:${CMAKE_BINARY_DIR}/bin
+diff --color -ruN a/applets/appmenu/qml/main.qml b/applets/appmenu/qml/main.qml
+--- a/applets/appmenu/qml/main.qml	2026-10-27 08:32:06.000000000 -0300
++++ b/applets/appmenu/qml/main.qml	2026-10-30 14:03:32.764389459 -0300
+@@ -148,7 +148,7 @@
+         containmentStatus: Plasmoid.containment.status
+         screenGeometry: root.screenGeometry
+         allScreens: Plasmoid.configuration.allScreens
+-        onRequestActivateIndex: Plasmoid.requestActivateIndex(index)
++        onRequestActivateIndex: index => Plasmoid.requestActivateIndex(index)
+         Component.onCompleted: {
+             Plasmoid.model = appMenuModel;
+         }

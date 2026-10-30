@@ -6,4 +6,8 @@
 *.bz2
 *.png
 *.jar
+*.pkg.tar.*
+*.sig
+*.log
 /*/*/
+!/*/keys/

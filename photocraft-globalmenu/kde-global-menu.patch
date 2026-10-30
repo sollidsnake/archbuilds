@@ -1,0 +1,1317 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 8f4fd3a..66464b9 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4990,6 +4990,7 @@ dependencies = [
+  "photocraft-format",
+  "photocraft-geom",
+  "photocraft-io",
++ "photocraft-kde-appmenu",
+  "photocraft-raster",
+  "photocraft-tablet",
+  "photocraft-ui-egui",
+@@ -5279,6 +5280,15 @@ dependencies = [
+ name = "photocraft-ipp"
+ version = "0.17.0"
+ 
++[[package]]
++name = "photocraft-kde-appmenu"
++version = "0.17.0"
++dependencies = [
++ "wayland-backend",
++ "wayland-client",
++ "wayland-protocols-plasma",
++]
++
+ [[package]]
+ name = "photocraft-ops"
+ version = "0.17.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 720b167..1a40100 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -36,6 +36,7 @@ photocraft-engine = { path = "crates/engine" }
+ photocraft-ui-egui = { path = "crates/ui-egui" }
+ photocraft-testkit = { path = "crates/testkit" }
+ photocraft-tablet = { path = "crates/tablet" }
++photocraft-kde-appmenu = { path = "crates/kde-appmenu" }
+ photocraft-ipp = { path = "crates/ipp" }
+ 
+ # external
+diff --git a/apps/photocraft/Cargo.toml b/apps/photocraft/Cargo.toml
+index 5de916c..0094b92 100644
+--- a/apps/photocraft/Cargo.toml
++++ b/apps/photocraft/Cargo.toml
+@@ -78,8 +78,11 @@ x11rb = { version = "=0.13.2", default-features = false, features = ["image", "r
+ # Clipboard images in types other than PNG on Wayland (`services.rs`, #2546): arboard asks for
+ # image/png only. Already in Cargo.lock (arboard's wayland-data-control); pinned exactly.
+ wl-clipboard-rs = { version = "=0.9.4", default-features = false }
+-# Wayland desktop color selection through the existing XDG portal transport.
++# Wayland desktop color selection through the existing XDG portal transport; also serves KDE
++# Plasma's global menu (`dbus_menu.rs`, com.canonical.dbusmenu).
+ zbus = "=5.19.0"
++# The global menu on native Wayland: links winit's surface to the menu (isolated unsafe helper).
++photocraft-kde-appmenu = { workspace = true }
+ # Caption button glyphs from the desktop's icon theme (`caption_style.rs`): SVG paths only, no
+ # text or images. Already in Cargo.lock (photocraft-io); pinned exactly.
+ resvg = { version = "=0.45.1", default-features = false }
+diff --git a/apps/photocraft/src/dbus_menu.rs b/apps/photocraft/src/dbus_menu.rs
+new file mode 100644
+index 0000000..f1d9842
+--- /dev/null
++++ b/apps/photocraft/src/dbus_menu.rs
+@@ -0,0 +1,549 @@
++//! KDE Plasma's global menu: the menus served on the session bus as `com.canonical.dbusmenu` (the
++//! protocol Qt and GTK apps use there), laid out as the in-window menus are
++//! (`photocraft_ui_egui::native_menu::desktop_layout`). The menus themselves and how a click runs
++//! are in `native_menu`; this file serves them and links them to the window.
++//!
++//! - Installed only while the desktop shows a global menu, `com.canonical.AppMenu.Registrar` on
++//!   the session bus (Plasma's appmenu module owns it), as Qt decides for KDE apps. Otherwise,
++//!   or when anything here fails, the in-window menus stay. `--in-window-menus` keeps them too.
++//! - KWin links the window to the menu: on Wayland through `org_kde_kwin_appmenu`
++//!   (`photocraft_kde_appmenu`), on X11 through the `_KDE_NET_WM_APPMENU_*` window properties.
++//! - Items are numbered depth first, 0 being the root. A change of structure (an Open Recent file,
++//!   a document opened or closed, a language switch) renumbers them and sends `LayoutUpdated`;
++//!   labels, enabled and checked change in place (`ItemsPropertiesUpdated`).
++//! - A click (the "clicked" event) runs the item's command like an in-window click. Shortcuts are
++//!   only shown: the window keeps the keyboard, so they run in egui as usual. Alt+letter in the
++//!   window opens that menu in the panel (`ItemActivationRequested`).
++
++use std::collections::HashMap;
++use std::ffi::c_void;
++use std::ptr::NonNull;
++use std::sync::mpsc::{Receiver, Sender, channel};
++use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
++
++use photocraft_ui_egui::native_menu::{self, Backend, Chord, Event, Flavor, MenuBar, NativeMenu, Node};
++use zbus::object_server::SignalEmitter;
++use zbus::zvariant::{OwnedValue, StructureBuilder, Value};
++
++/// Where the menu is served (the path Qt uses).
++const PATH: &str = "/MenuBar/1";
++/// Owned while the desktop shows global menus.
++const REGISTRAR: &str = "com.canonical.AppMenu.Registrar";
++
++/// Properties by name, as the protocol sends them.
++type Props = HashMap<String, Value<'static>>;
++/// An item and its children: `(ia{sv}av)`, the children being the same, each in a variant.
++type Layout = (i32, Props, Vec<Value<'static>>);
++
++/// One item as the protocol shows it.
++#[derive(Clone, Debug, PartialEq)]
++struct Row {
++    kind: Kind,
++    /// With its mnemonic marked ([`mnemonic_label`]).
++    label: String,
++    enabled: bool,
++    /// The ids of the items in it (the root, a menu or a submenu).
++    children: Vec<i32>,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++enum Kind {
++    Root,
++    /// A top menu or a submenu.
++    Menu,
++    Separator,
++    Item {
++        command: String,
++        /// [`shortcut`]; empty for none.
++        shortcut: Vec<Vec<String>>,
++        checked: Option<bool>,
++    },
++}
++
++/// What the bus thread serves and the app thread updates.
++struct Tree {
++    revision: u32,
++    rows: Vec<Row>,
++}
++
++/// The menu's rows, in id order, from the desktop layout.
++fn rows(bar: &MenuBar) -> Vec<Row> {
++    let mut rows = vec![Row { kind: Kind::Root, label: String::new(), enabled: true, children: Vec::new() }];
++    let tops: Vec<i32> = bar.menus.iter().map(|m| push_menu(&mut rows, &m.title, m.mnemonic, &m.children, true)).collect();
++    if let Some(root) = rows.first_mut() {
++        root.children = tops;
++    }
++    rows
++}
++
++/// Add a menu or submenu and everything in it; returns its id. A top menu is always enabled, as
++/// its in-window title is; a submenu only while something in it can run, as in the window.
++fn push_menu(rows: &mut Vec<Row>, title: &str, mnemonic: Option<char>, nodes: &[Node], top: bool) -> i32 {
++    let at = rows.len();
++    rows.push(Row { kind: Kind::Menu, label: mnemonic_label(title, mnemonic), enabled: true, children: Vec::new() });
++    let mut children = Vec::with_capacity(nodes.len());
++    let mut any_enabled = false;
++    for n in nodes {
++        let id = match n {
++            Node::Item(it) => {
++                any_enabled |= it.enabled;
++                let shortcut = it.shortcut.as_deref().and_then(shortcut).unwrap_or_default();
++                let kind = Kind::Item { command: it.id.clone(), shortcut, checked: it.checked };
++                push(rows, Row { kind, label: mnemonic_label(&it.label, it.mnemonic), enabled: it.enabled, children: Vec::new() })
++            }
++            Node::Separator => push(rows, Row { kind: Kind::Separator, label: String::new(), enabled: true, children: Vec::new() }),
++            Node::Submenu { label, children: inner, mnemonic, .. } => {
++                let id = push_menu(rows, label, *mnemonic, inner, false);
++                any_enabled |= row(rows, id).is_some_and(|r| r.enabled);
++                id
++            }
++            // macOS's own items; the desktop layout has none.
++            Node::Standard(_) => continue,
++        };
++        children.push(id);
++    }
++    if let Some(menu) = rows.get_mut(at) {
++        menu.children = children;
++        menu.enabled = top || any_enabled;
++    }
++    id_of(at)
++}
++
++fn push(rows: &mut Vec<Row>, row: Row) -> i32 {
++    rows.push(row);
++    id_of(rows.len() - 1)
++}
++
++fn id_of(index: usize) -> i32 {
++    i32::try_from(index).unwrap_or(i32::MAX)
++}
++
++fn row(rows: &[Row], id: i32) -> Option<&Row> {
++    rows.get(usize::try_from(id).ok()?)
++}
++
++/// `label` as the protocol writes it: `_` before the mnemonic's first occurrence (in any case),
++/// literal underscores doubled. Plasma underlines it and runs the row on that key.
++fn mnemonic_label(label: &str, mnemonic: Option<char>) -> String {
++    let mut out = String::with_capacity(label.len() + 1);
++    let mut pending = mnemonic.map(|c| c.to_ascii_uppercase());
++    for c in label.chars() {
++        if pending.is_some_and(|m| c.to_ascii_uppercase() == m) {
++            out.push('_');
++            pending = None;
++        }
++        if c == '_' {
++            out.push('_');
++        }
++        out.push(c);
++    }
++    out
++}
++
++/// A shortcut as the protocol writes it, one key combination of key names Qt reads:
++/// `Cmd+Shift+Z` is `[["Control", "Shift", "Z"]]`. `Cmd` is Ctrl off macOS (and Ctrl+Cmd one Ctrl).
++fn shortcut(s: &str) -> Option<Vec<Vec<String>>> {
++    let c = Chord::parse(s)?;
++    let mut keys: Vec<String> = [(c.cmd || c.ctrl, "Control"), (c.alt, "Alt"), (c.shift, "Shift")]
++        .into_iter()
++        .filter(|(on, _)| *on)
++        .map(|(_, name)| name.to_string())
++        .collect();
++    let key = match c.key.as_str() {
++        // libdbusmenu's names for these two.
++        "+" => "plus",
++        "-" => "minus",
++        "Delete" => "Del",
++        "Enter" => "Return",
++        "Escape" => "Esc",
++        "Insert" => "Ins",
++        "PageUp" => "PgUp",
++        "PageDown" => "PgDown",
++        "ArrowLeft" => "Left",
++        "ArrowRight" => "Right",
++        "ArrowUp" => "Up",
++        "ArrowDown" => "Down",
++        k => k,
++    };
++    keys.push(key.to_string());
++    Some(vec![keys])
++}
++
++/// A row's properties (only those that differ from the protocol's defaults, plus `enabled`).
++fn props(row: &Row) -> Props {
++    let mut p = Props::new();
++    let mut set = |name: &str, value: Value<'static>| {
++        p.insert(name.to_string(), value);
++    };
++    match &row.kind {
++        Kind::Root => set("children-display", "submenu".into()),
++        Kind::Menu => {
++            set("label", row.label.clone().into());
++            set("enabled", row.enabled.into());
++            set("children-display", "submenu".into());
++        }
++        Kind::Separator => set("type", "separator".into()),
++        Kind::Item { shortcut, checked, .. } => {
++            set("label", row.label.clone().into());
++            set("enabled", row.enabled.into());
++            if let Some(on) = checked {
++                set("toggle-type", "checkmark".into());
++                set("toggle-state", i32::from(*on).into());
++            }
++            if !shortcut.is_empty() {
++                set("shortcut", shortcut.clone().into());
++            }
++        }
++    }
++    p
++}
++
++/// `props` narrowed to `names` (all of them when `names` is empty).
++fn only(mut props: Props, names: &[String]) -> Props {
++    if !names.is_empty() {
++        props.retain(|k, _| names.contains(k));
++    }
++    props
++}
++
++/// The item `id` and its children `depth` levels down (all of them for -1).
++fn layout(rows: &[Row], id: i32, depth: i32, names: &[String]) -> Option<Layout> {
++    let r = row(rows, id)?;
++    let children = if depth == 0 {
++        Vec::new()
++    } else {
++        r.children
++            .iter()
++            .filter_map(|&child| layout(rows, child, depth.saturating_sub(1).max(-1), names))
++            .filter_map(|(id, props, children)| StructureBuilder::new().add_field(id).add_field(props).add_field(children).build().ok())
++            .map(Value::from)
++            .collect()
++    };
++    Some((id, only(props(r), names), children))
++}
++
++/// Do two menus differ only in labels, enabled and checked (else they are renumbered)?
++fn same_shape(a: &[Row], b: &[Row]) -> bool {
++    a.len() == b.len()
++        && a.iter().zip(b).all(|(x, y)| {
++            x.children == y.children
++                && match (&x.kind, &y.kind) {
++                    (Kind::Item { command: c1, shortcut: s1, checked: k1 }, Kind::Item { command: c2, shortcut: s2, checked: k2 }) => {
++                        c1 == c2 && s1 == s2 && k1.is_some() == k2.is_some()
++                    }
++                    (k1, k2) => std::mem::discriminant(k1) == std::mem::discriminant(k2),
++                }
++        })
++}
++
++fn lock(tree: &Mutex<Tree>) -> MutexGuard<'_, Tree> {
++    tree.lock().unwrap_or_else(PoisonError::into_inner)
++}
++
++/// The `com.canonical.dbusmenu` object, answering on zbus's thread.
++struct Server {
++    tree: Arc<Mutex<Tree>>,
++    clicks: Sender<String>,
++    repaint: egui::Context,
++}
++
++#[zbus::interface(name = "com.canonical.dbusmenu")]
++impl Server {
++    fn get_layout(&self, parent_id: i32, recursion_depth: i32, property_names: Vec<String>) -> zbus::fdo::Result<(u32, Layout)> {
++        let tree = lock(&self.tree);
++        let layout = layout(&tree.rows, parent_id, recursion_depth, &property_names).ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no item {parent_id}")))?;
++        Ok((tree.revision, layout))
++    }
++
++    fn get_group_properties(&self, ids: Vec<i32>, property_names: Vec<String>) -> Vec<(i32, Props)> {
++        let tree = lock(&self.tree);
++        // No ids asks for every item.
++        let ids = if ids.is_empty() { (0..tree.rows.len()).map(id_of).collect() } else { ids };
++        ids.into_iter().filter_map(|id| Some((id, only(props(row(&tree.rows, id)?), &property_names)))).collect()
++    }
++
++    fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<Value<'static>> {
++        let tree = lock(&self.tree);
++        let r = row(&tree.rows, id).ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no item {id}")))?;
++        props(r).remove(&name).ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("item {id} has no {name}")))
++    }
++
++    fn event(&self, id: i32, event_id: String, _data: OwnedValue, _timestamp: u32) -> zbus::fdo::Result<()> {
++        if self.handle(id, &event_id) { Ok(()) } else { Err(zbus::fdo::Error::InvalidArgs(format!("no item {id}"))) }
++    }
++
++    /// Returns the ids that aren't items.
++    fn event_group(&self, events: Vec<(i32, String, OwnedValue, u32)>) -> Vec<i32> {
++        events.into_iter().filter(|(id, event, _, _)| !self.handle(*id, event)).map(|(id, ..)| id).collect()
++    }
++
++    /// The menu is kept up to date as the app changes, so it never needs fetching again here.
++    fn about_to_show(&self, _id: i32) -> bool {
++        false
++    }
++
++    /// No updates needed; the ids that aren't items.
++    fn about_to_show_group(&self, ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
++        let tree = lock(&self.tree);
++        (Vec::new(), ids.into_iter().filter(|&id| row(&tree.rows, id).is_none()).collect())
++    }
++
++    #[zbus(property)]
++    fn version(&self) -> u32 {
++        3
++    }
++
++    #[zbus(property)]
++    fn text_direction(&self) -> String {
++        if photocraft_ui_egui::direction::is_rtl() { "rtl" } else { "ltr" }.into()
++    }
++
++    #[zbus(property)]
++    fn status(&self) -> String {
++        "normal".into()
++    }
++
++    #[zbus(property)]
++    fn icon_theme_path(&self) -> Vec<String> {
++        Vec::new()
++    }
++
++    #[zbus(signal)]
++    async fn items_properties_updated(emitter: &SignalEmitter<'_>, updated_props: Vec<(i32, Props)>, removed_props: Vec<(i32, Vec<String>)>) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    async fn layout_updated(emitter: &SignalEmitter<'_>, revision: u32, parent: i32) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    async fn item_activation_requested(emitter: &SignalEmitter<'_>, id: i32, timestamp: u32) -> zbus::Result<()>;
++}
++
++impl Server {
++    /// An event on item `id`: a click on a command is queued for the app. False when there is no
++    /// such item.
++    fn handle(&self, id: i32, event: &str) -> bool {
++        let tree = lock(&self.tree);
++        let Some(r) = row(&tree.rows, id) else { return false };
++        if let (Kind::Item { command, .. }, "clicked") = (&r.kind, event) {
++            let _ = self.clicks.send(command.clone());
++            // Wake egui, so the command runs now rather than on the next mouse move.
++            self.repaint.request_repaint();
++        }
++        true
++    }
++}
++
++/// The global menu backend: the served tree, and the clicks from the bus thread.
++pub struct DbusMenu {
++    iface: zbus::blocking::object_server::InterfaceRef<Server>,
++    tree: Arc<Mutex<Tree>>,
++    clicks: Receiver<String>,
++    /// Kept open: the menu is served on it.
++    _conn: zbus::blocking::Connection,
++}
++
++impl DbusMenu {
++    fn emitter(&self) -> &SignalEmitter<'static> {
++        self.iface.signal_emitter()
++    }
++}
++
++impl Backend for DbusMenu {
++    fn sync(&mut self, bar: &MenuBar) {
++        let new = rows(bar);
++        let mut tree = lock(&self.tree);
++        if same_shape(&tree.rows, &new) {
++            let updated: Vec<(i32, Props)> = tree.rows.iter().zip(&new).enumerate().filter(|(_, (old, now))| old != now).map(|(i, (_, now))| (id_of(i), props(now))).collect();
++            tree.rows = new;
++            drop(tree);
++            if !updated.is_empty()
++                && let Err(e) = zbus::block_on(Server::items_properties_updated(self.emitter(), updated, Vec::new()))
++            {
++                log::warn!("global menu: couldn't update items: {e}");
++            }
++        } else {
++            tree.rows = new;
++            tree.revision = tree.revision.wrapping_add(1);
++            let revision = tree.revision;
++            drop(tree);
++            if let Err(e) = zbus::block_on(Server::layout_updated(self.emitter(), revision, 0)) {
++                log::warn!("global menu: couldn't update the layout: {e}");
++            }
++        }
++    }
++
++    fn drain(&mut self) -> Vec<Event> {
++        self.clicks.try_iter().map(Event::Click).collect()
++    }
++
++    fn open_menu(&mut self, index: usize) {
++        let id = lock(&self.tree).rows.first().and_then(|root| root.children.get(index)).copied();
++        if let Some(id) = id
++            && let Err(e) = zbus::block_on(Server::item_activation_requested(self.emitter(), id, 0))
++        {
++            log::warn!("global menu: couldn't open a menu: {e}");
++        }
++    }
++}
++
++/// How KWin is told which menu is the window's.
++enum Link {
++    X11(u32),
++    Wayland { display: NonNull<c_void>, surface: NonNull<c_void> },
++}
++
++impl Link {
++    fn of(cc: &eframe::CreationContext<'_>) -> Option<Link> {
++        use eframe::wgpu::rwh::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
++        match (cc.display_handle().ok()?.as_raw(), cc.window_handle().ok()?.as_raw()) {
++            (_, RawWindowHandle::Xlib(h)) => u32::try_from(h.window).ok().map(Link::X11),
++            (_, RawWindowHandle::Xcb(h)) => Some(Link::X11(h.window.get())),
++            (RawDisplayHandle::Wayland(d), RawWindowHandle::Wayland(w)) => Some(Link::Wayland { display: d.display, surface: w.surface }),
++            _ => None,
++        }
++    }
++
++    fn set(&self, service: &str, path: &str) -> Result<(), String> {
++        match self {
++            Link::X11(window) => set_x11_properties(*window, service, path),
++            Link::Wayland { display, surface } => photocraft_kde_appmenu::set_address(*display, *surface, service, path),
++        }
++    }
++}
++
++/// `_KDE_NET_WM_APPMENU_SERVICE_NAME` and `…_OBJECT_PATH` on the window, as Qt sets them.
++fn set_x11_properties(window: u32, service: &str, path: &str) -> Result<(), String> {
++    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
++    use x11rb::wrapper::ConnectionExt as _;
++    let (conn, _) = x11rb::rust_connection::RustConnection::connect(None).map_err(|e| e.to_string())?;
++    for (name, value) in [("_KDE_NET_WM_APPMENU_SERVICE_NAME", service), ("_KDE_NET_WM_APPMENU_OBJECT_PATH", path)] {
++        let atom = conn.intern_atom(false, name.as_bytes()).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.atom;
++        conn.change_property8(PropMode::REPLACE, window, atom, AtomEnum::STRING, value.as_bytes())
++            .map_err(|e| e.to_string())?
++            .check()
++            .map_err(|e| e.to_string())?;
++    }
++    Ok(())
++}
++
++/// Serve the global menu and link it to the window, when the desktop shows one (in eframe's
++/// creator closure, where the window exists). None keeps the in-window menus.
++pub fn install(cc: &eframe::CreationContext<'_>, app: &photocraft_ui_egui::PhotocraftApp) -> Option<NativeMenu> {
++    match try_install(cc, app) {
++        Ok(menu) => menu,
++        Err(e) => {
++            log::warn!("couldn't set up the global menu ({e}); using the in-window menus");
++            None
++        }
++    }
++}
++
++fn try_install(cc: &eframe::CreationContext<'_>, app: &photocraft_ui_egui::PhotocraftApp) -> Result<Option<NativeMenu>, String> {
++    let Some(link) = Link::of(cc) else { return Ok(None) };
++    let conn = zbus::blocking::connection::Builder::session()
++        .and_then(|b| b.method_timeout(std::time::Duration::from_secs(2)).build())
++        .map_err(|e| e.to_string())?;
++    let dbus = zbus::blocking::fdo::DBusProxy::new(&conn).map_err(|e| e.to_string())?;
++    let registrar = zbus::names::BusName::try_from(REGISTRAR).map_err(|e| e.to_string())?;
++    if !dbus.name_has_owner(registrar).map_err(|e| e.to_string())? {
++        return Ok(None);
++    }
++    let language = &app.session.prefs().interface.language;
++    let bar = native_menu::desktop_layout(&photocraft_ui_egui::menus::menu_items(app), photocraft_ui_egui::i18n::Lang::from_pref(language));
++    let tree = Arc::new(Mutex::new(Tree { revision: 1, rows: rows(&bar) }));
++    let (tx, rx) = channel();
++    let server = Server { tree: Arc::clone(&tree), clicks: tx, repaint: cc.egui_ctx.clone() };
++    conn.object_server().at(PATH, server).map_err(|e| e.to_string())?;
++    let iface = conn.object_server().interface::<_, Server>(PATH).map_err(|e| e.to_string())?;
++    let service = conn.unique_name().ok_or("no bus name")?.to_string();
++    // Served before it is linked, as the protocol asks.
++    link.set(&service, PATH)?;
++    let menu = DbusMenu { iface, tree, clicks: rx, _conn: conn };
++    Ok(Some(NativeMenu::with_flavor(Box::new(menu), Flavor::Desktop)))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn bar() -> MenuBar {
++        let app = photocraft_ui_egui::PhotocraftApp::new(photocraft_engine::Session::new(), photocraft_ui_egui::Services::default());
++        native_menu::desktop_layout(&photocraft_ui_egui::menus::menu_items(&app), photocraft_ui_egui::i18n::Lang::EN)
++    }
++
++    #[test]
++    fn mnemonics_are_marked_and_underscores_doubled() {
++        assert_eq!(mnemonic_label("File", Some('F')), "_File");
++        assert_eq!(mnemonic_label("Type", Some('Y')), "T_ype");
++        assert_eq!(mnemonic_label("snake_case", Some('C')), "snake___case");
++        assert_eq!(mnemonic_label("文件(F)", Some('F')), "文件(_F)");
++        assert_eq!(mnemonic_label("a_b", None), "a__b");
++    }
++
++    #[test]
++    fn shortcuts_use_qt_key_names() {
++        let sc = |s: &str| shortcut(s).and_then(|v| v.into_iter().next()).map(|keys| keys.join("+"));
++        assert_eq!(sc("Cmd+Shift+Z").as_deref(), Some("Control+Shift+Z"));
++        assert_eq!(sc("Ctrl+Cmd+M").as_deref(), Some("Control+M"));
++        assert_eq!(sc("Cmd++").as_deref(), Some("Control+plus"));
++        assert_eq!(sc("Cmd+-").as_deref(), Some("Control+minus"));
++        assert_eq!(sc("Alt+Delete").as_deref(), Some("Alt+Del"));
++        assert_eq!(sc("F5").as_deref(), Some("F5"));
++    }
++
++    /// The panel shows the in-window menus: File…Help with their mnemonics, every row once.
++    #[test]
++    fn rows_follow_the_in_window_menus() {
++        let bar = bar();
++        let rows = rows(&bar);
++        let root = &rows[0];
++        let titles: Vec<&str> = root.children.iter().map(|&id| row(&rows, id).unwrap().label.as_str()).collect();
++        assert_eq!(titles, ["_File", "_Edit", "_Image", "_Layer", "T_ype", "_Select", "Fil_ter", "_View", "_Window", "_Help"]);
++        let items = rows.iter().filter(|r| matches!(r.kind, Kind::Item { .. })).count();
++        assert_eq!(items, bar.items().len());
++        // Every child id points at a later row, so the tree has no cycles.
++        for (i, r) in rows.iter().enumerate() {
++            assert!(r.children.iter().all(|&c| usize::try_from(c).unwrap() > i));
++        }
++    }
++
++    #[test]
++    fn layout_nests_items_in_variants() {
++        let rows = rows(&bar());
++        let (id, props, children) = layout(&rows, 0, -1, &[]).unwrap();
++        assert_eq!(id, 0);
++        assert_eq!(props.get("children-display"), Some(&Value::from("submenu")));
++        assert_eq!(children.len(), 10);
++        // One level asked: the menus come without their items.
++        let (_, _, shallow) = layout(&rows, 0, 1, &["label".into()]).unwrap();
++        let Value::Structure(file) = &shallow[0] else { panic!("not a structure") };
++        let fields = file.fields();
++        assert_eq!(fields[0], Value::from(1i32));
++        assert!(matches!(&fields[2], Value::Array(a) if a.is_empty()));
++        assert!(layout(&rows, 100_000, -1, &[]).is_none());
++    }
++
++    #[test]
++    fn checked_and_enabled_change_in_place() {
++        let bar = bar();
++        let mut other = bar.clone();
++        let flip = |nodes: &mut Vec<Node>| {
++            for n in nodes {
++                if let Node::Item(it) = n {
++                    it.enabled = !it.enabled;
++                    it.checked = it.checked.map(|c| !c);
++                    it.label.push('!');
++                }
++            }
++        };
++        for m in &mut other.menus {
++            flip(&mut m.children);
++        }
++        assert!(same_shape(&rows(&bar), &rows(&other)));
++        // A new row renumbers.
++        if let Some(m) = other.menus.first_mut() {
++            m.children.push(Node::Separator);
++        }
++        assert!(!same_shape(&rows(&bar), &rows(&other)));
++    }
++}
+diff --git a/apps/photocraft/src/launch_args.rs b/apps/photocraft/src/launch_args.rs
+index 5e54f84..ee1b8e0 100644
+--- a/apps/photocraft/src/launch_args.rs
++++ b/apps/photocraft/src/launch_args.rs
+@@ -31,8 +31,8 @@ pub(crate) struct LaunchArgs {
+     /// Start with the CPU renderer for this launch (after a graphics driver crash)
+     #[arg(long)]
+     pub(crate) safe_gpu: bool,
+-    /// macOS: keep the menus inside the window instead of the menu bar (the variable: 0, false, no
+-    /// or off is off; empty is unset)
++    /// macOS and KDE Plasma: keep the menus inside the window instead of the menu bar or global
++    /// menu (the variable: 0, false, no or off is off; empty is unset)
+     #[arg(long, env = "PHOTOCRAFT_IN_WINDOW_MENUS", value_parser = FalseyValueParser::new())]
+     pub(crate) in_window_menus: bool,
+     /// Windows and Linux: start a separate PhotoCraft instead of opening the files in the one
+diff --git a/apps/photocraft/src/main.rs b/apps/photocraft/src/main.rs
+index d1a3b68..95e84fc 100644
+--- a/apps/photocraft/src/main.rs
++++ b/apps/photocraft/src/main.rs
+@@ -17,7 +17,8 @@
+ //! crashes inside the driver also falls back by itself next time (see `gpu_startup`).
+ //!
+ //! `--in-window-menus` (or `PHOTOCRAFT_IN_WINDOW_MENUS=1`) keeps the menus inside the window on
+-//! macOS instead of the macOS menu bar (`mac_menu`).
++//! macOS instead of the macOS menu bar (`mac_menu`), and on Linux instead of KDE Plasma's global
++//! menu (`dbus_menu`).
+ //!
+ //! `--control <port>` (or `PHOTOCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server.
+ //! The first line must authenticate; subsequent request lines get reply lines.
+@@ -39,6 +40,8 @@ mod caption_style;
+ mod control_server;
+ mod crash_guard;
+ mod cursor;
++#[cfg(target_os = "linux")]
++mod dbus_menu;
+ mod file_dialog_probe;
+ mod gpu_startup;
+ #[cfg(target_os = "linux")]
+@@ -613,7 +616,12 @@ fn main() -> eframe::Result {
+                     app.services.native_menu = mac_menu::install(&cc.egui_ctx, &app);
+                 }
+             }
+-            #[cfg(not(target_os = "macos"))]
++            // KDE Plasma's global menu, while the desktop shows one.
++            #[cfg(target_os = "linux")]
++            if !in_window_menus {
++                app.services.native_menu = dbus_menu::install(cc, &app);
++            }
++            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+             let _ = in_window_menus;
+             // Files from later launches (Explorer, file managers) open here as new tabs.
+             #[cfg(not(target_os = "macos"))]
+diff --git a/crates/kde-appmenu/Cargo.toml b/crates/kde-appmenu/Cargo.toml
+new file mode 100644
+index 0000000..0723f4a
+--- /dev/null
++++ b/crates/kde-appmenu/Cargo.toml
+@@ -0,0 +1,27 @@
++[package]
++name = "photocraft-kde-appmenu"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++description = "Link a winit window's Wayland surface to its D-Bus menu for KDE Plasma's global menu (org_kde_kwin_appmenu)"
++
++# An isolated `unsafe` helper crate, like photocraft-tablet: the appmenu object has to be created
++# on winit's own `wl_display` connection for winit's `wl_surface`, which needs foreign-display
++# interop. Only `set_address` allows `unsafe`; everything else is denied, and every other crate
++# keeps the workspace's `unsafe_code = "forbid"`.
++[lints.rust]
++unsafe_code = "deny"
++
++[lints.clippy]
++ cognitive_complexity = "deny"
++ too_many_arguments = "deny"
++ wildcard_imports = "deny"
++ dbg_macro = "warn"
++ todo = "warn"
++
++# Already in Cargo.lock (winit's Wayland backend pulls them in); pinned exactly: review the diff
++# before bumping.
++[target.'cfg(target_os = "linux")'.dependencies]
++wayland-client = { version = "=0.31.15", default-features = false }
++wayland-backend = { version = "=0.3.17", default-features = false, features = ["client_system"] }
++wayland-protocols-plasma = { version = "=0.3.12", default-features = false, features = ["client"] }
+diff --git a/crates/kde-appmenu/src/lib.rs b/crates/kde-appmenu/src/lib.rs
+new file mode 100644
+index 0000000..74a3789
+--- /dev/null
++++ b/crates/kde-appmenu/src/lib.rs
+@@ -0,0 +1,72 @@
++//! KDE Plasma's global menu on Wayland: tell KWin where a window's menu is on D-Bus.
++//!
++//! A Wayland client links a `wl_surface` to its `com.canonical.dbusmenu` object with KDE's
++//! `org_kde_kwin_appmenu` protocol (`set_address(service, path)`); Plasma's global menu then
++//! imports the menu of whichever window is active. The object must be created on the same
++//! `wl_display` connection as the surface, and the surface is winit's, so this plugs into winit's
++//! connection as a guest ([`wayland_backend::client::Backend::from_foreign_display`]): the one
++//! `unsafe` step, in [`set_address`].
++//!
++//! Everything created here lives as long as the process: KWin drops the menu with the surface,
++//! and dropping the guest connection while its objects are alive would leave libwayland routing
++//! later events (a new output's `wl_registry` global) to a destroyed queue.
++//!
++//! On X11 the same link is two window properties (`_KDE_NET_WM_APPMENU_SERVICE_NAME` and
++//! `…_OBJECT_PATH`), set by the app with x11rb and no `unsafe`.
++
++#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
++
++#[cfg(target_os = "linux")]
++mod linux {
++    use std::ffi::c_void;
++    use std::ptr::NonNull;
++
++    use wayland_backend::client::{Backend, ObjectId};
++    use wayland_client::globals::{GlobalListContents, registry_queue_init};
++    use wayland_client::protocol::wl_registry::{self, WlRegistry};
++    use wayland_client::protocol::wl_surface::WlSurface;
++    use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
++    use wayland_protocols_plasma::appmenu::client::org_kde_kwin_appmenu::OrgKdeKwinAppmenu;
++    use wayland_protocols_plasma::appmenu::client::org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager;
++
++    /// Our queue's state. The appmenu interfaces have no events, and the registry's later ones
++    /// (outputs coming and going) are never dispatched.
++    struct State;
++
++    impl Dispatch<WlRegistry, GlobalListContents> for State {
++        fn event(_: &mut Self, _: &WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
++    }
++
++    delegate_noop!(State: ignore OrgKdeKwinAppmenuManager);
++    delegate_noop!(State: ignore OrgKdeKwinAppmenu);
++
++    /// Link `surface` (winit's `wl_surface`, on `display`) to the D-Bus menu at `service`/`path`.
++    /// Fails, changing nothing, when the compositor has no `org_kde_kwin_appmenu_manager` (not
++    /// KWin) or the connection fails.
++    #[allow(unsafe_code)]
++    pub fn set_address(display: NonNull<c_void>, surface: NonNull<c_void>, service: &str, path: &str) -> Result<(), String> {
++        // SAFETY: `display` is winit's live `wl_display` (from the window's display handle), and
++        // winit keeps it connected for as long as the window exists. The guest backend made from
++        // it is never dropped (forgotten below), and is used only in this call, while the window
++        // that `display` belongs to is alive.
++        let backend = unsafe { Backend::from_foreign_display(display.as_ptr().cast()) };
++        let conn = Connection::from_backend(backend);
++        let (globals, queue) = registry_queue_init::<State>(&conn).map_err(|e| e.to_string())?;
++        let qh = queue.handle();
++        let manager: OrgKdeKwinAppmenuManager = globals.bind(&qh, 1..=2, ()).map_err(|e| e.to_string())?;
++        // SAFETY: `surface` is the window's live `wl_surface` proxy (from its window handle), on
++        // the same `display`. The id is used only to name the surface in `create` below, while
++        // the window, and so its surface, exist; `from_ptr` checks the proxy's interface.
++        let id = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.as_ptr().cast()) }.map_err(|e| e.to_string())?;
++        let surface = WlSurface::from_id(&conn, id).map_err(|e| e.to_string())?;
++        let appmenu = manager.create(&surface, &qh, ());
++        appmenu.set_address(service.to_string(), path.to_string());
++        conn.flush().map_err(|e| e.to_string())?;
++        // Kept for the process's life (see the module docs).
++        std::mem::forget((conn, queue, globals, manager, surface, appmenu));
++        Ok(())
++    }
++}
++
++#[cfg(target_os = "linux")]
++pub use linux::set_address;
+diff --git a/crates/ui-egui/src/menus/bar.rs b/crates/ui-egui/src/menus/bar.rs
+index db9e8ae..b468aa1 100644
+--- a/crates/ui-egui/src/menus/bar.rs
++++ b/crates/ui-egui/src/menus/bar.rs
+@@ -24,10 +24,7 @@ pub fn menu_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> f32 {
+     let mut keys = crate::menu_keys::Keys::load(ui.ctx());
+     keys.take_first_row(&mut nav);
+     nav.underline = keys.show_underlines(ui.ctx());
+-    let translated: Vec<String> = TOP_MENUS.iter().map(|top| crate::i18n::tr(lang, top).to_string()).collect();
+-    let preferred: Vec<Option<char>> = TOP_MENUS.iter().map(|top| crate::menu_keys::TOP_PREFERRED.iter().find(|(t, _)| t == top).map(|(_, c)| *c)).collect();
+-    // A title with no Latin letter shows its English key: "文件(F)" (#5863).
+-    let (top_labels, top_mnemonics) = crate::menu_keys::localized(&translated, &TOP_MENUS, &preferred);
++    let (top_labels, top_mnemonics) = crate::menu_keys::top_titles(lang);
+     ui.scope(|ui| {
+         ui.spacing_mut().item_spacing.x = 0.0;
+         let v = &mut ui.style_mut().visuals;
+diff --git a/crates/ui-egui/src/menus/menu_keys.rs b/crates/ui-egui/src/menus/menu_keys.rs
+index 903d2e6..1a595c0 100644
+--- a/crates/ui-egui/src/menus/menu_keys.rs
++++ b/crates/ui-egui/src/menus/menu_keys.rs
+@@ -99,8 +99,17 @@ fn is_command_key(key: Key, mods: Modifiers) -> bool {
+     mods.command || mods.ctrl || mods.mac_cmd || function_key
+ }
+ 
++/// The top menus' titles as shown in `lang` and their mnemonics, in [`crate::menus::TOP_MENUS`]
++/// order. A title with no Latin letter shows its English key: "文件(F)" (#5863).
++pub fn top_titles(lang: crate::i18n::Lang) -> (Vec<String>, Vec<Option<char>>) {
++    use crate::menus::TOP_MENUS;
++    let translated: Vec<String> = TOP_MENUS.iter().map(|top| crate::i18n::tr(lang, top).to_string()).collect();
++    let preferred: Vec<Option<char>> = TOP_MENUS.iter().map(|top| TOP_PREFERRED.iter().find(|(t, _)| t == top).map(|(_, c)| *c)).collect();
++    localized(&translated, &TOP_MENUS, &preferred)
++}
++
+ /// The mnemonic a key press stands for: the letter or digit of a plain key.
+-fn key_char(key: Key) -> Option<char> {
++pub(crate) fn key_char(key: Key) -> Option<char> {
+     let name = key.name();
+     let mut chars = name.chars();
+     match (chars.next(), chars.next()) {
+diff --git a/crates/ui-egui/src/menus/native_menu.rs b/crates/ui-egui/src/menus/native_menu.rs
+index 4dad63c..2649f87 100644
+--- a/crates/ui-egui/src/menus/native_menu.rs
++++ b/crates/ui-egui/src/menus/native_menu.rs
+@@ -18,6 +18,11 @@
+ //! [`NativeMenu::raw_input`] feeds it to egui as the key press it was: the shortcut runs through
+ //! [`crate::shortcuts::handle`] exactly as without a native menu. A click is [`Event::Click`] and
+ //! runs the command like an in-window menu click.
++//!
++//! **A desktop's global menu** (KDE Plasma, [`Flavor::Desktop`]) shows the in-window menus as they
++//! are ([`desktop_layout`]): same menus and order, translated the same way, with the same
++//! mnemonics. Keys are not involved: the window keeps the keyboard, so shortcuts reach egui as
++//! usual, and Alt+letter asks the desktop to open that menu ([`keys`]).
+ 
+ use std::collections::HashMap;
+ use std::hash::{DefaultHasher, Hash, Hasher};
+@@ -40,6 +45,8 @@ pub struct Menu {
+     pub title: String,
+     pub role: MenuRole,
+     pub children: Vec<Node>,
++    /// The letter that opens it from the keyboard ([`desktop_layout`]; None on macOS).
++    pub mnemonic: Option<char>,
+ }
+ 
+ /// What a top-level menu is for. macOS treats the app, Window and Help menus specially.
+@@ -60,6 +67,8 @@ pub enum Node {
+         label: String,
+         children: Vec<Node>,
+         role: Option<ItemRole>,
++        /// As [`Menu::mnemonic`].
++        mnemonic: Option<char>,
+     },
+     /// An item AppKit provides and runs itself (Services, Zoom, …).
+     Standard(Standard),
+@@ -76,6 +85,8 @@ pub struct Item {
+     /// `Some` for check items.
+     pub checked: Option<bool>,
+     pub role: Option<ItemRole>,
++    /// As [`Menu::mnemonic`]: the letter that runs it in its open menu.
++    pub mnemonic: Option<char>,
+ }
+ 
+ /// Items macOS expects in fixed places.
+@@ -110,7 +121,7 @@ pub const MINIMIZE: &str = "window.minimize";
+ 
+ impl Item {
+     fn new(id: &str, label: &str) -> Item {
+-        Item { id: id.into(), label: label.into(), shortcut: None, enabled: true, checked: None, role: None }
++        Item { id: id.into(), label: label.into(), shortcut: None, enabled: true, checked: None, role: None, mnemonic: None }
+     }
+ }
+ 
+@@ -193,6 +204,7 @@ pub fn from_items(tops: &[&str], items: &[MenuItem]) -> MenuBar {
+                         enabled: it.enabled,
+                         checked: it.checked,
+                         role: None,
++                        mnemonic: None,
+                     }));
+                 }
+             } else if let Some(name) = it.path.get(depth) {
+@@ -202,7 +214,7 @@ pub fn from_items(tops: &[&str], items: &[MenuItem]) -> MenuBar {
+                 }
+                 shown.push(name);
+                 let child: Vec<&MenuItem> = rows.iter().copied().filter(|c| c.path.get(depth).map(String::as_str) == Some(name)).collect();
+-                out.push(Node::Submenu { label: name.to_string(), children: level(&child, depth + 1), role: None });
++                out.push(Node::Submenu { label: name.to_string(), children: level(&child, depth + 1), role: None, mnemonic: None });
+             }
+         }
+         tidy(out)
+@@ -211,7 +223,7 @@ pub fn from_items(tops: &[&str], items: &[MenuItem]) -> MenuBar {
+         .iter()
+         .map(|top| {
+             let rows: Vec<&MenuItem> = items.iter().filter(|i| i.path.first().map(String::as_str) == Some(*top)).collect();
+-            Menu { title: top.to_string(), role: MenuRole::Normal, children: level(&rows, 1) }
++            Menu { title: top.to_string(), role: MenuRole::Normal, children: level(&rows, 1), mnemonic: None }
+         })
+         .collect();
+     MenuBar { menus }
+@@ -222,7 +234,7 @@ fn tidy(nodes: Vec<Node>) -> Vec<Node> {
+     let mut out: Vec<Node> = Vec::with_capacity(nodes.len());
+     for n in nodes {
+         let n = match n {
+-            Node::Submenu { label, children, role } => Node::Submenu { label, children: tidy(children), role },
++            Node::Submenu { label, children, role, mnemonic } => Node::Submenu { label, children: tidy(children), role, mnemonic },
+             other => other,
+         };
+         if matches!(n, Node::Separator) && matches!(out.last(), None | Some(Node::Separator)) {
+@@ -277,7 +289,7 @@ fn hash_nodes(nodes: &[Node], h: &mut DefaultHasher) {
+         match n {
+             Node::Item(it) => ('i', &it.id, it.checked.is_some(), &it.shortcut, it.role).hash(h),
+             Node::Separator => '-'.hash(h),
+-            Node::Submenu { label, children, role } => {
++            Node::Submenu { label, children, role, .. } => {
+                 ('[', label, role).hash(h);
+                 hash_nodes(children, h);
+                 ']'.hash(h);
+@@ -443,7 +455,7 @@ pub fn mac_layout(bar: &MenuBar, lang: Lang) -> Layout {
+         }
+         menu.push(Node::Item(quit));
+     }
+-    bar.menus.insert(0, Menu { title: APP_NAME.into(), role: MenuRole::App, children: menu });
++    bar.menus.insert(0, Menu { title: APP_NAME.into(), role: MenuRole::App, children: menu, mnemonic: None });
+ 
+     match taken("Cmd+W", None) {
+         Some(command) => clashes.push(Clash { shortcut: "Cmd+W", system: "Close Window", command, resolution: "no system Close Window item" }),
+@@ -456,7 +468,7 @@ pub fn mac_layout(bar: &MenuBar, lang: Lang) -> Layout {
+ 
+     if bar.menu(MenuRole::Window).is_none() {
+         let at = bar.menus.iter().position(|m| m.role == MenuRole::Help).unwrap_or(bar.menus.len());
+-        bar.menus.insert(at, Menu { title: "Window".into(), role: MenuRole::Window, children: Vec::new() });
++        bar.menus.insert(at, Menu { title: "Window".into(), role: MenuRole::Window, children: Vec::new(), mnemonic: None });
+     }
+     let minimize = match taken("Cmd+M", None) {
+         Some(command) => {
+@@ -510,7 +522,7 @@ fn settings_node(node: Node, comma_taken: Option<String>, lang: Lang, clashes: &
+             if let Some(Node::Item(first)) = children.iter_mut().find(|n| matches!(n, Node::Item(i) if i.enabled)) {
+                 give(first);
+             }
+-            Node::Submenu { label: tr(lang, "Settings").into(), children, role }
++            Node::Submenu { label: tr(lang, "Settings").into(), children, role, mnemonic: None }
+         }
+         other => other,
+     }
+@@ -527,7 +539,7 @@ fn appearance_node(bar: &mut MenuBar, lang: Lang) -> Option<Node> {
+         next.role = None;
+         children.extend([Node::Separator, Node::Item(next)]);
+     }
+-    Some(Node::Submenu { label: tr(lang, "Appearance").into(), children, role: Some(ItemRole::Appearance) })
++    Some(Node::Submenu { label: tr(lang, "Appearance").into(), children, role: Some(ItemRole::Appearance), mnemonic: None })
+ }
+ 
+ /// Command ids of the app menu's Language items: `app.language.<code>`, where `auto` follows the
+@@ -544,10 +556,11 @@ fn language_node(pref: &str, lang: Lang) -> Node {
+         enabled: true,
+         checked: Some(pref == code),
+         role: Some(ItemRole::Language),
++        mnemonic: None,
+     };
+     let mut children = vec![Node::Item(item("auto", tr(lang, "Auto"))), Node::Separator];
+     children.extend(Lang::for_picker().into_iter().map(|l| Node::Item(item(l.code(), l.name()))));
+-    Node::Submenu { label: tr(lang, "Language").into(), children, role: Some(ItemRole::Language) }
++    Node::Submenu { label: tr(lang, "Language").into(), children, role: Some(ItemRole::Language), mnemonic: None }
+ }
+ 
+ fn node_ids(node: &Node) -> Vec<String> {
+@@ -579,7 +592,7 @@ fn translate(bar: &mut MenuBar, lang: Lang) {
+             match n {
+                 // A document's name is shown as it is.
+                 Node::Item(it) if it.role.is_none() && !it.id.starts_with(crate::menus::DOCUMENT_ITEM) => it.label = tr_id(lang, &it.id, &it.label).to_string(),
+-                Node::Submenu { label, children, role } => {
++                Node::Submenu { label, children, role, .. } => {
+                     if role.is_none() {
+                         *label = tr(lang, label).to_string();
+                     }
+@@ -623,6 +636,53 @@ pub fn photocraft_layout(items: &[MenuItem], lang: Lang, language: &str) -> Layo
+     layout
+ }
+ 
++// ----------------------------------------------------------------------------- desktop layout
++
++/// PhotoCraft's menus for a desktop's global menu (KDE Plasma): the in-window menus as they are,
++/// in the UI language, with each level's mnemonics assigned as the in-window menus assign them
++/// ([`crate::menu_keys`]), "(F)" suffixes included.
++pub fn desktop_layout(items: &[MenuItem], lang: Lang) -> MenuBar {
++    let mut bar = from_items(&crate::menus::TOP_MENUS, items);
++    let (titles, keys) = crate::menu_keys::top_titles(lang);
++    for ((m, title), key) in bar.menus.iter_mut().zip(titles).zip(keys) {
++        m.title = title;
++        m.mnemonic = key;
++        label_level(&mut m.children, lang);
++    }
++    bar
++}
++
++/// Translate one level's rows and submenus as the in-window menu shows them, give them their
++/// mnemonics, and do the same in each submenu.
++fn label_level(nodes: &mut [Node], lang: Lang) {
++    let (translated, english): (Vec<String>, Vec<&str>) = nodes
++        .iter()
++        .filter_map(|n| match n {
++            Node::Item(it) => Some((super::state::translated_label(lang, &it.id, &it.label), it.label.as_str())),
++            Node::Submenu { label, .. } => Some((tr(lang, label).to_string(), label.as_str())),
++            Node::Separator | Node::Standard(_) => None,
++        })
++        .unzip();
++    let (shown, keys) = crate::menu_keys::localized(&translated, &english, &[]);
++    let mut rows = shown.into_iter().zip(keys);
++    for n in nodes {
++        match n {
++            Node::Item(it) => {
++                if let Some((label, key)) = rows.next() {
++                    (it.label, it.mnemonic) = (label, key);
++                }
++            }
++            Node::Submenu { label, children, mnemonic, .. } => {
++                if let Some((shown, key)) = rows.next() {
++                    (*label, *mnemonic) = (shown, key);
++                }
++                label_level(children, lang);
++            }
++            Node::Separator | Node::Standard(_) => {}
++        }
++    }
++}
++
+ // ----------------------------------------------------------------------------- the app's side
+ 
+ /// What the native menu reports.
+@@ -634,7 +694,8 @@ pub enum Event {
+     Key(Chord),
+ }
+ 
+-/// A platform's native menu bar (the desktop app implements it for macOS with muda).
++/// A platform's native menu bar (the desktop app implements it for macOS with muda, and for
++/// KDE Plasma's global menu over D-Bus).
+ pub trait Backend {
+     /// Bring the menu in step with `bar`: update labels, enabled and checked in place, or
+     /// rebuild when its structure changed.
+@@ -642,11 +703,25 @@ pub trait Backend {
+     /// Events since the last call. Platform items (Hide, Services, Zoom, …) are handled by the
+     /// backend and not reported.
+     fn drain(&mut self) -> Vec<Event>;
++    /// Open the top menu at `index` (in [`MenuBar::menus`]) from the keyboard, where the platform
++    /// lets the app ask for that.
++    fn open_menu(&mut self, _index: usize) {}
++}
++
++/// Which menu bar a native menu shows.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum Flavor {
++    /// The macOS menu bar ([`photocraft_layout`]).
++    #[default]
++    Mac,
++    /// A desktop's global menu, KDE Plasma's ([`desktop_layout`]).
++    Desktop,
+ }
+ 
+ /// The native menu bar, while PhotoCraft uses one (the in-window menus are hidden then).
+ pub struct NativeMenu {
+     backend: Box<dyn Backend>,
++    flavor: Flavor,
+     /// Hash of the state the menus were last built from.
+     state: Option<u64>,
+     clicks: Vec<String>,
+@@ -657,7 +732,11 @@ pub struct NativeMenu {
+ 
+ impl NativeMenu {
+     pub fn new(backend: Box<dyn Backend>) -> NativeMenu {
+-        NativeMenu { backend, state: None, clicks: Vec::new(), dirty: true, logged: false }
++        NativeMenu::with_flavor(backend, Flavor::Mac)
++    }
++
++    pub fn with_flavor(backend: Box<dyn Backend>, flavor: Flavor) -> NativeMenu {
++        NativeMenu { backend, flavor, state: None, clicks: Vec::new(), dirty: true, logged: false }
+     }
+ 
+     /// Before egui sees this frame's input: key equivalents become the key presses they were,
+@@ -707,6 +786,29 @@ pub fn run(app: &mut PhotocraftApp, ctx: &egui::Context) {
+     }
+ }
+ 
++/// The keyboard on a desktop's global menu, which the window keeps: Alt+letter asks the desktop
++/// to open the menu with that mnemonic, and F10 the first one, as they open the in-window menus
++/// ([`crate::menu_keys`]). Runs where the in-window menu bar would.
++pub fn keys(app: &mut PhotocraftApp, ctx: &egui::Context) {
++    let Some(menu) = app.services.native_menu.as_mut().filter(|m| m.flavor == Flavor::Desktop) else { return };
++    let (_, mnemonics) = crate::menu_keys::top_titles(crate::i18n::current());
++    let events = ctx.input(|i| i.events.clone());
++    for e in &events {
++        let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = e else { continue };
++        let (mods, index) = if *key == Key::F10 && modifiers.is_none() {
++            (Modifiers::NONE, Some(0))
++        } else if modifiers.alt && !modifiers.command && !modifiers.ctrl {
++            (Modifiers::ALT, crate::menu_keys::key_char(*key).and_then(|c| mnemonics.iter().position(|m| *m == Some(c))))
++        } else {
++            continue;
++        };
++        let Some(index) = index else { continue };
++        ctx.input_mut(|i| i.consume_key(mods, *key));
++        menu.backend.open_menu(index);
++        return;
++    }
++}
++
+ /// Bring the native menu up to date when anything it shows may have changed: a command ran, the
+ /// document or selection changed, or the user clicked or pressed a key. Building the rows walks
+ /// every command's enabled state, so it doesn't run on frames that only animate or scroll.
+@@ -716,12 +818,16 @@ pub fn sync(app: &mut PhotocraftApp, ctx: &egui::Context) {
+     if menu.state == Some(state) && !menu.dirty {
+         return;
+     }
++    let flavor = menu.flavor;
+     let lang = crate::i18n::current();
+     let mut items = crate::menus::menu_items(app);
+     for it in &mut items {
+         it.enabled &= crate::menus::modal_allows(app, &it.id);
+     }
+-    let layout = photocraft_layout(&items, lang, &app.session.prefs().interface.language);
++    let layout = match flavor {
++        Flavor::Mac => photocraft_layout(&items, lang, &app.session.prefs().interface.language),
++        Flavor::Desktop => Layout { bar: desktop_layout(&items, lang), clashes: Vec::new() },
++    };
+     let Some(menu) = app.services.native_menu.as_mut() else { return };
+     if !menu.logged {
+         for c in &layout.clashes {
+diff --git a/crates/ui-egui/src/menus/native_menu/tests.rs b/crates/ui-egui/src/menus/native_menu/tests.rs
+index f01d125..c1ef485 100644
+--- a/crates/ui-egui/src/menus/native_menu/tests.rs
++++ b/crates/ui-egui/src/menus/native_menu/tests.rs
+@@ -485,3 +485,106 @@ fn opening_or_closing_a_workspace_without_input_rebuilds_the_menus() {
+     app.distort.gallery = None;
+     assert_eq!(state_hash(&app, None), closed, "and come back when it is cancelled");
+ }
++
++// ----------------------------------------------------------------------------- desktop layout
++
++fn desktop(lang: Lang) -> MenuBar {
++    desktop_layout(&crate::menus::menu_items(&app(true)), lang)
++}
++
++/// A global menu shows the in-window menus: the same menus and rows, nothing macOS adds.
++#[test]
++fn the_desktop_layout_is_the_in_window_menus() {
++    let items = crate::menus::menu_items(&app(true));
++    let bar = desktop_layout(&items, Lang::EN);
++    let titles: Vec<&str> = bar.menus.iter().map(|m| m.title.as_str()).collect();
++    assert_eq!(titles, crate::menus::TOP_MENUS);
++    assert!(bar.menus.iter().all(|m| m.role == MenuRole::Normal));
++    let ids = |b: &MenuBar| b.items().iter().map(|it| it.id.clone()).collect::<Vec<_>>();
++    assert_eq!(ids(&bar), ids(&from_items(&crate::menus::TOP_MENUS, &items)));
++    fn no_standard(nodes: &[Node]) -> bool {
++        nodes.iter().all(|n| match n {
++            Node::Standard(_) => false,
++            Node::Submenu { children, .. } => no_standard(children),
++            _ => true,
++        })
++    }
++    assert!(bar.menus.iter().all(|m| no_standard(&m.children)));
++    assert!(bar.find(HIDE).is_none() && bar.find(MINIMIZE).is_none());
++    // Rows under a menu (commands without a menu path aren't in the window's menus either).
++    let shown = |it: &&crate::menus::MenuItem| it.label != "---" && it.path.first().is_some_and(|top| crate::menus::TOP_MENUS.contains(&top.as_str()));
++    for it in items.iter().filter(shown) {
++        assert_eq!(bar.find(&it.id).map(|b| b.label.clone()), Some(crate::menus::state::translated_menu_label(Lang::EN, it)), "{}", it.id);
++    }
++}
++
++/// Every level has the in-window menus' mnemonics: Photoshop's letters for the menus, and unique
++/// letters at each level.
++#[test]
++fn desktop_mnemonics_match_the_in_window_menus() {
++    let bar = desktop(Lang::EN);
++    let keys: String = bar.menus.iter().filter_map(|m| m.mnemonic).collect();
++    assert_eq!(keys, "FEILYSTVWH");
++    fn unique(nodes: &[Node]) {
++        let keys: Vec<char> = nodes
++            .iter()
++            .filter_map(|n| match n {
++                Node::Item(it) => it.mnemonic,
++                Node::Submenu { mnemonic, .. } => *mnemonic,
++                _ => None,
++            })
++            .collect();
++        let mut distinct = keys.clone();
++        distinct.sort_unstable();
++        distinct.dedup();
++        assert_eq!(distinct.len(), keys.len(), "{keys:?}");
++        for n in nodes {
++            if let Node::Submenu { children, .. } = n {
++                unique(children);
++            }
++        }
++    }
++    for m in &bar.menus {
++        unique(&m.children);
++    }
++    assert_eq!(bar.find("file.new").and_then(|it| it.mnemonic), Some('N'));
++}
++
++/// Translated as in the window; a title without Latin letters shows its key, "ファイル(F)".
++#[test]
++fn the_desktop_layout_is_translated() {
++    let de = Lang::from_code("de").unwrap();
++    assert_eq!(desktop(de).menus[0].title, tr(de, "File"));
++    let ja = desktop(Lang::from_code("ja").unwrap());
++    assert!(ja.menus[0].title.ends_with("(F)"), "{}", ja.menus[0].title);
++    assert_eq!(ja.menus[0].mnemonic, Some('F'));
++}
++
++struct Opener(std::rc::Rc<std::cell::RefCell<Vec<usize>>>);
++
++impl Backend for Opener {
++    fn sync(&mut self, _: &MenuBar) {}
++    fn drain(&mut self) -> Vec<Event> {
++        Vec::new()
++    }
++    fn open_menu(&mut self, index: usize) {
++        self.0.borrow_mut().push(index);
++    }
++}
++
++/// On a global menu, Alt+letter opens that menu in the desktop's bar and F10 the first one; the
++/// macOS menu bar leaves those keys alone.
++#[test]
++fn alt_letters_open_the_desktop_menu() {
++    for (flavor, expected) in [(Flavor::Desktop, vec![4, 0]), (Flavor::Mac, vec![])] {
++        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
++        let mut app = app(true);
++        app.services.native_menu = Some(NativeMenu::with_flavor(Box::new(Opener(opened.clone())), flavor));
++        let ctx = egui::Context::default();
++        for (key, modifiers) in [(Key::Y, Modifiers::ALT), (Key::F10, Modifiers::NONE)] {
++            let raw = egui::RawInput { events: vec![egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers }], ..Default::default() };
++            frame(&ctx, raw, |ui| keys(&mut app, ui.ctx()));
++        }
++        assert_eq!(*opened.borrow(), expected, "{flavor:?}");
++    }
++}
+diff --git a/crates/ui-egui/src/menus/state.rs b/crates/ui-egui/src/menus/state.rs
+index 7baa0b9..181ae63 100644
+--- a/crates/ui-egui/src/menus/state.rs
++++ b/crates/ui-egui/src/menus/state.rs
+@@ -217,14 +217,19 @@ pub(crate) fn reveal_label() -> &'static str {
+ /// Translate the fixed command label and substitute the currently configured export format.
+ /// Reuse the existing translated PNG sentence, so dynamic formats work in every UI language.
+ pub(super) fn translated_menu_label(lang: crate::i18n::Lang, item: &MenuItem) -> String {
++    translated_label(lang, &item.id, &item.label)
++}
++
++/// [`translated_menu_label`] of the row with command `id` and English `label`.
++pub(super) fn translated_label(lang: crate::i18n::Lang, id: &str, label: &str) -> String {
+     // A document's name is shown as it is.
+-    if item.id.starts_with(DOCUMENT_ITEM) {
+-        return item.label.clone();
++    if id.starts_with(DOCUMENT_ITEM) {
++        return label.to_string();
+     }
+-    if item.id == "file.export.quickExportAsPng"
+-        && let Some(fmt) = item.label.strip_prefix("Quick Export as ")
++    if id == "file.export.quickExportAsPng"
++        && let Some(fmt) = label.strip_prefix("Quick Export as ")
+     {
+-        return crate::i18n::tr_id(lang, &item.id, "Quick Export as PNG").replace("PNG", fmt);
++        return crate::i18n::tr_id(lang, id, "Quick Export as PNG").replace("PNG", fmt);
+     }
+-    crate::i18n::tr_id(lang, &item.id, &item.label).to_string()
++    crate::i18n::tr_id(lang, id, label).to_string()
+ }
+diff --git a/crates/ui-egui/src/panels/title_bar.rs b/crates/ui-egui/src/panels/title_bar.rs
+index d93315a..e8b0f13 100644
+--- a/crates/ui-egui/src/panels/title_bar.rs
++++ b/crates/ui-egui/src/panels/title_bar.rs
+@@ -67,9 +67,10 @@ pub fn title_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+                     crate::brand::paint_mark(ui, mark);
+                     ui.add_space(6.0);
+                 }
+-                // With the macOS menu bar the menus are at the top of the screen instead. Either way
+-                // this is the menus' inner edge, facing the title.
++                // With the macOS menu bar (or the desktop's global menu) the menus are at the top
++                // of the screen instead. Either way this is the menus' inner edge, facing the title.
+                 let menus_end = if app.services.native_menu.is_some() {
++                    crate::native_menu::keys(app, ui.ctx());
+                     if rtl { ui.cursor().right() } else { ui.cursor().left() }
+                 } else {
+                     crate::menus::menu_bar(app, ui)
+diff --git a/crates/ui-egui/src/services.rs b/crates/ui-egui/src/services.rs
+index 53d3c2e..847c460 100644
+--- a/crates/ui-egui/src/services.rs
++++ b/crates/ui-egui/src/services.rs
+@@ -434,7 +434,8 @@ pub struct Services {
+     /// Reads the displays and their ICC profiles in the background (desktop macOS; see
+     /// `monitor_status`). Without one, the canvas uses the profile chosen in Color Settings, or sRGB.
+     pub read_displays: Option<monitor_status::ReadDisplaysFn>,
+-    /// The macOS menu bar, when the desktop app installed one; the in-window menus are hidden then.
++    /// The macOS menu bar or KDE Plasma's global menu, when the desktop app installed one; the
++    /// in-window menus are hidden then.
+     pub native_menu: Option<native_menu::NativeMenu>,
+     /// Ends the app once leaving is settled (nothing unsaved, or the prompt answered), instead of
+     /// letting eframe close the window. macOS: `-[NSApplication terminate:]`. Closing the window
+diff --git a/docs/development.md b/docs/development.md
+index 41d74ba..57b1758 100644
+--- a/docs/development.md
++++ b/docs/development.md
+@@ -154,7 +154,7 @@ By default PhotoCraft's own crates log at `info` and everything else at `warn`.
+ | `PHOTOCRAFT_CONTROL_TOKEN_FILE` | Read, or create for a server, the control bearer-token file |
+ | `PHOTOCRAFT_AUTOMATION_READ_ROOT` | Desktop app only: automation read root (`--automation-read-root`). Headless CLI modes require the flag |
+ | `PHOTOCRAFT_AUTOMATION_WRITE_ROOT` | Desktop app only: automation write root (`--automation-write-root`). Headless CLI modes require the flag |
+-| `PHOTOCRAFT_IN_WINDOW_MENUS=1` (or `--in-window-menus`) | macOS: keep the menus inside the window instead of the menu bar. `0`, `false`, `no`, `off` or empty is off |
++| `PHOTOCRAFT_IN_WINDOW_MENUS=1` (or `--in-window-menus`) | macOS: keep the menus inside the window instead of the menu bar. Linux: instead of KDE Plasma's global menu, which is used while the desktop shows one (`com.canonical.AppMenu.Registrar` on the session bus). `0`, `false`, `no`, `off` or empty is off |
+ | `PHOTOCRAFT_CPU_CANVAS=1` | Force the CPU canvas path instead of the wgpu shader canvas |
+ | `PHOTOCRAFT_NATIVE_WAYLAND=1` | Linux: stay on native Wayland when a pen is attached (by default the window then opens through Xwayland, because Wayland gives the app no pen input; #639). A pen is an input device with `BTN_TOOL_PEN` and the `ABS_X`/`ABS_Y` axes; virtual keyboards that claim every key are not pens (#1072) |
+ | `PHOTOCRAFT_GPU_ADAPTER=nvidia` | Linux: use the graphics adapter whose name contains this (case-insensitive); overrides `performance.gpuAdapter` for one launch |
+diff --git a/xtask/src/layers.rs b/xtask/src/layers.rs
+index f2e6f53..7c397de 100644
+--- a/xtask/src/layers.rs
++++ b/xtask/src/layers.rs
+@@ -48,6 +48,8 @@ pub const TABLE: &[(&str, Class)] = &[
+     ("adobe-assets", Class::Standalone),
+     // Pen tablet input (the one isolated `unsafe` helper: AppKit interop on macOS).
+     ("tablet", Class::Standalone),
++    // KDE Plasma's global menu on Wayland (an isolated `unsafe` helper: winit's wl_display).
++    ("kde-appmenu", Class::Standalone),
+     ("doc", Class::Layer(1)),
+     ("ops", Class::Layer(2)),
+     ("paint", Class::Layer(2)),

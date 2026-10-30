@@ -1,0 +1,62 @@
+pkgname=photocraft-globalmenu
+_pkgname=photocraft
+pkgver=0.17.0
+pkgrel=1
+# The craft-fonts commit upstream's release workflow embeds (.github/workflows/release.yml).
+_fontsref=b076417b5880bd4154bd22f00695b1d28c6bea83
+pkgdesc='Layer-based image and photo editor, with KDE Plasma global menu support'
+arch=(x86_64)
+url="https://github.com/storytold/$_pkgname"
+license=('MIT OR Apache-2.0' 'OFL-1.1' 'LicenseRef-ArtCraft-brand' 'ISC' 'LicenseRef-SCOWL')
+depends=(glibc gcc-libs hicolor-icon-theme libxkbcommon libxkbcommon-x11
+         libx11 libxcursor libxi libxrandr wayland
+         libglvnd vulkan-icd-loader dbus)
+makedepends=(cargo)
+optdepends=('vulkan-driver: hardware-accelerated Vulkan rendering'
+            'xdg-desktop-portal: native file dialogs'
+            'xdg-utils: open external links')
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname" "$_pkgname-bin")
+options=(!lto !debug)
+source=("$_pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "craft-fonts-$_fontsref.tar.gz::https://github.com/storytold/craft-fonts/archive/$_fontsref.tar.gz"
+        kde-global-menu.patch)
+sha256sums=('c1a0370920eae0c5517bbff9dc8d748f1cd7698cb8ae11f22e7ddae9aefc5b18'
+            '35eadfeb7e4217a933f24b73a3d190b90fed81e6c933266f092c161746c0a9eb'
+            '1cb7b00d91c46f801a971690eba448ec17315932207c02d173fb99cf58d65710')
+
+prepare() {
+  cd "$_pkgname-$pkgver"
+  patch -Np1 -i ../kde-global-menu.patch
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+_env() {
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  export CRAFT_FONTS_DIR="$srcdir/craft-fonts-$_fontsref"
+  export PHOTOCRAFT_BUILD_SHA="v$pkgver-kde-global-menu"
+}
+
+build() {
+  cd "$_pkgname-$pkgver"
+  _env
+  # As packaging/linux/package.sh builds the release; the man pages and completions come from an
+  # example built on its own, so its dev-dependencies' features stay out of the binaries.
+  cargo build --frozen --release -p photocraft -p photocraft-cli --features heif --bins
+  cargo build --frozen --release -p photocraft-cli --features heif --example man-and-completions
+}
+
+package() {
+  cd "$_pkgname-$pkgver"
+  _env
+  # Upstream's own staging (desktop entry, MIME, metainfo, icons, docs, man pages, completions),
+  # as in the release tarball that photocraft-bin repackages.
+  DIST="$srcdir/dist" packaging/linux/package.sh --skip-build --formats tar
+  cp -a target/linux-package/root/usr "$pkgdir/"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname/" \
+    LICENSE-MIT LICENSE-APACHE NOTICE docs/brand/LICENSE-brand.txt \
+    assets/dict/LICENSE-SCOWL.txt assets/fonts/OFL-*.txt assets/icons/LICENSE-lucide.txt
+  install -Dm644 assets/app-icon/LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/LICENSE-app-icon.txt"
+}

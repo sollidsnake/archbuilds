@@ -1,0 +1,2 @@
+option('plasma_wayland_protocols_dir', type: 'string', value: '/usr/share/plasma-wayland-protocols',
+  description: 'Where plasma-wayland-protocols installed appmenu.xml')

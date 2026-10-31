@@ -1,0 +1,30 @@
+pkgname=kde-appmenu-gtk-module
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='GTK 3 module that puts menu bars in the KDE Plasma Global Menu, natively on Wayland'
+arch=(x86_64)
+license=(MIT)
+depends=(glibc glib2 gtk3 libdbusmenu-glib libdbusmenu-gtk3 libx11 wayland)
+makedepends=(meson plasma-wayland-protocols)
+# both hide the menu bars of every GTK 3 app, and appmenu-gtk-module can't link them to Plasma on Wayland
+conflicts=(appmenu-gtk-module)
+source=(kde-appmenu-gtk-module.c
+        meson.build
+        meson_options.txt
+        60-kde-appmenu-gtk-module.conf
+        LICENSE)
+sha256sums=('0e2b1ceaba037a26936aa2029453116666adb183253c38834de032bcfb7682c5'
+            'c56d7d0800f138c97b2080081f699065e52edec71a05ee61ebd129ef9accf715'
+            'cbff9d8cf2a12f510706f4c8adae0f86d4ccedf467bb7e62d3b7c5f9b65bdb8a'
+            '90a7962300bca0564392638f82d8553148dcb82fcf4e848d6c10ddc6755c0490'
+            '100d5989d79c650939e6144a0827f7258b04ca2df938c779d213ab4549ce5c32')
+
+build() {
+  arch-meson . build
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+}

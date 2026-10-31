@@ -16,6 +16,16 @@ when it's used from the keyboard on Wayland:
   like in every other menu.
 - **First open after plasmashell starts.** Before plasmashell got any input, the keyboard couldn't
   open the menu at all. Uses the same input serial workaround as the appmenu kded module.
+- **Missing Alt underlines.** Holding Alt often underlined the wrong letter or none at all.
+  `Kirigami.MnemonicData` hands out letters from a pool shared by all of plasmashell, where the
+  buttons from before the last menu reload and the applets on other panels still held them. The
+  buttons now underline the letter the app marked, which is the one it reacts to.
+- **Alt brings up a hidden panel (optional, off by default).** Turn on "Show hidden panel after
+  holding Alt for" in the applet's settings, with a delay of 0–5000 ms (1000 by default). Holding
+  Alt that long then shows an auto-hidden panel with a Global Menu, so you can see the menus and
+  their letters. It hides again when Alt is released, unless a menu got opened. Only the panel
+  that would open the menu on Alt+letter shows up (the one on the active window's screen), and
+  only if the window has a menu.
 
 Also fixes the `Parameter "index" is not declared` QML warning on the mnemonic path.
 

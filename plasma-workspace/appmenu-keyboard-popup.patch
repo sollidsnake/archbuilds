@@ -1,6 +1,6 @@
 diff --color -ruN a/applets/appmenu/appmenuapplet.cpp b/applets/appmenu/appmenuapplet.cpp
---- a/applets/appmenu/appmenuapplet.cpp	2026-10-27 08:32:06.000000000 -0300
-+++ b/applets/appmenu/appmenuapplet.cpp	2026-10-30 14:03:32.765520432 -0300
+--- a/applets/appmenu/appmenuapplet.cpp	2026-10-31 13:34:05.876347530 -0300
++++ b/applets/appmenu/appmenuapplet.cpp	2026-10-31 13:34:05.880452256 -0300
 @@ -17,6 +17,8 @@
  #include <QQuickWindow>
  #include <QScreen>
@@ -63,8 +63,8 @@ diff --color -ruN a/applets/appmenu/appmenuapplet.cpp b/applets/appmenu/appmenua
              if (m_currentMenu->isVisible()) {
                  m_currentMenu->move(pos);
 diff --color -ruN a/applets/appmenu/appmenumodel.cpp b/applets/appmenu/appmenumodel.cpp
---- a/applets/appmenu/appmenumodel.cpp	2026-10-27 08:32:06.000000000 -0300
-+++ b/applets/appmenu/appmenumodel.cpp	2026-10-30 14:03:32.765313835 -0300
+--- a/applets/appmenu/appmenumodel.cpp	2026-10-31 13:34:05.876370384 -0300
++++ b/applets/appmenu/appmenumodel.cpp	2026-10-31 13:34:05.880523854 -0300
 @@ -11,6 +11,7 @@
  #include <QDBusConnectionInterface>
  #include <QDBusServiceWatcher>
@@ -158,19 +158,21 @@ diff --color -ruN a/applets/appmenu/appmenumodel.cpp b/applets/appmenu/appmenumo
              }
  
 diff --color -ruN a/applets/appmenu/appmenumodel.h b/applets/appmenu/appmenumodel.h
---- a/applets/appmenu/appmenumodel.h	2026-10-27 08:32:06.000000000 -0300
-+++ b/applets/appmenu/appmenumodel.h	2026-10-30 14:03:32.765282345 -0300
-@@ -99,6 +99,7 @@
+--- a/applets/appmenu/appmenumodel.h	2026-10-31 13:34:05.876382347 -0300
++++ b/applets/appmenu/appmenumodel.h	2026-10-31 13:43:26.406812209 -0300
+@@ -65,6 +65,9 @@
  
-     void removeSearchActionsFromMenu();
-     void insertSearchActionsIntoMenu(const QString &filter = QString());
-+    bool handlesActivationRequests() const;
+     bool eventFilter(QObject *watched, QEvent *event) override;
  
-     QDBusServiceWatcher *m_serviceWatcher;
-     QString m_serviceName;
++    // whether this is the applet that opens the current menu on the app's Alt+<mnemonic> requests
++    Q_INVOKABLE bool handlesActivationRequests() const;
++
+ Q_SIGNALS:
+     void requestActivateIndex(int index);
+     void bringToFocus(int index);
 diff --color -ruN a/applets/appmenu/CMakeLists.txt b/applets/appmenu/CMakeLists.txt
---- a/applets/appmenu/CMakeLists.txt	2026-10-27 08:32:06.000000000 -0300
-+++ b/applets/appmenu/CMakeLists.txt	2026-10-30 14:03:32.765491657 -0300
+--- a/applets/appmenu/CMakeLists.txt	2026-10-31 13:34:05.876323794 -0300
++++ b/applets/appmenu/CMakeLists.txt	2026-10-31 13:34:05.880605391 -0300
 @@ -19,6 +19,7 @@
      Qt::Widgets
      Qt::Quick
@@ -191,10 +193,134 @@ diff --color -ruN a/applets/appmenu/CMakeLists.txt b/applets/appmenu/CMakeLists.
  add_test(NAME applet_appmenu_smoketest COMMAND plasmawindowed --smoke-test org.kde.plasma.appmenu)
  set_tests_properties(applet_appmenu_smoketest PROPERTIES
      ENVIRONMENT_MODIFICATION QT_PLUGIN_PATH=path_list_prepend:${CMAKE_BINARY_DIR}/bin
+diff --color -ruN a/applets/appmenu/main.xml b/applets/appmenu/main.xml
+--- a/applets/appmenu/main.xml	2026-10-31 13:34:05.876391645 -0300
++++ b/applets/appmenu/main.xml	2026-10-31 14:01:39.603876165 -0300
+@@ -17,4 +17,18 @@
+     </entry>
+   </group>
+ 
++  <group name="Behavior">
++    <entry name="altHoldReveal" type="Bool">
++      <label>Whether holding Alt brings up the panel if it's hidden.</label>
++      <default>false</default>
++    </entry>
++
++    <entry name="altHoldRevealDelay" type="Int">
++      <label>How long Alt has to be held, in milliseconds, to bring up the panel if it's hidden.</label>
++      <default>1000</default>
++      <min>0</min>
++      <max>5000</max>
++    </entry>
++  </group>
++
+ </kcfg>
+diff --color -ruN a/applets/appmenu/qml/configGeneral.qml b/applets/appmenu/qml/configGeneral.qml
+--- a/applets/appmenu/qml/configGeneral.qml	2026-10-31 13:34:05.876446941 -0300
++++ b/applets/appmenu/qml/configGeneral.qml	2026-10-31 14:01:35.338442056 -0300
+@@ -6,6 +6,7 @@
+ 
+ import QtQuick
+ import QtQuick.Controls
++import QtQuick.Layouts
+ 
+ import org.kde.kirigami as Kirigami
+ import org.kde.plasma.plasmoid
+@@ -14,6 +15,8 @@
+ KCM.SimpleKCM {
+     property alias cfg_compactView: compactViewRadioButton.checked
+     property alias cfg_allScreens: allScreensCheckBox.checked
++    property alias cfg_altHoldReveal: altHoldRevealCheckBox.checked
++    property alias cfg_altHoldRevealDelay: altHoldRevealDelaySpinBox.value
+ 
+     Kirigami.FormLayout {
+         RadioButton {
+@@ -31,5 +34,27 @@
+             id: allScreensCheckBox
+             text: i18n("Show menus for apps on different screens")
+         }
++
++        RowLayout {
++            // only the full menu reveals the panel
++            enabled: fullViewRadioButton.checked
++
++            CheckBox {
++                id: altHoldRevealCheckBox
++                text: i18nc("@option:check", "Show hidden panel after holding Alt for:")
++            }
++
++            SpinBox {
++                id: altHoldRevealDelaySpinBox
++                enabled: altHoldRevealCheckBox.checked
++                from: 0
++                to: 5000
++                stepSize: 100
++                editable: true
++                textFromValue: (value, locale) => i18ncp("@item:valuesuffix", "%1 ms", "%1 ms", value)
++                valueFromText: (text, locale) => Number(text.replace(/\D/g, ""))
++                Accessible.name: altHoldRevealCheckBox.text
++            }
++        }
+     }
+ }
 diff --color -ruN a/applets/appmenu/qml/main.qml b/applets/appmenu/qml/main.qml
---- a/applets/appmenu/qml/main.qml	2026-10-27 08:32:06.000000000 -0300
-+++ b/applets/appmenu/qml/main.qml	2026-10-30 14:03:32.764389459 -0300
-@@ -148,7 +148,7 @@
+--- a/applets/appmenu/qml/main.qml	2026-10-31 13:34:05.876456960 -0300
++++ b/applets/appmenu/qml/main.qml	2026-10-31 14:01:35.338508324 -0300
+@@ -56,8 +56,12 @@
+     fullRepresentation: GridLayout {
+         id: buttonGrid
+ 
++        // see altHoldTimer
++        property bool revealedByAlt: false
++
++        // NeedsAttention also brings up a hidden panel
+         Plasmoid.status: {
+-            if (appMenuModel.menuAvailable && Plasmoid.currentIndex > -1 && buttonRepeater.count > 0) {
++            if (appMenuModel.menuAvailable && buttonRepeater.count > 0 && (Plasmoid.currentIndex > -1 || revealedByAlt)) {
+                 return PlasmaCore.Types.NeedsAttentionStatus;
+             } else {
+                 return buttonRepeater.count > 0 || Plasmoid.configuration.compactView ? PlasmaCore.Types.ActiveStatus : PlasmaCore.Types.HiddenStatus;
+@@ -120,21 +124,32 @@
+                 Layout.fillWidth: root.vertical
+                 Layout.fillHeight: !root.vertical
+                 text: activeMenu
+-                Kirigami.MnemonicData.active: altState.pressed
++                showMnemonic: altState.pressed
+ 
+                 down: Plasmoid.currentIndex === index
+                 visible: text !== "" && (activeActions?.visible ?? false)
+ 
+                 menuIsOpen: Plasmoid.currentIndex !== -1
+                 onActivated: Plasmoid.trigger(this, index)
+-
+-                // So we can show mnemonic underlines only while Alt is pressed
+-                KeyboardIndicator.KeyState {
+-                    id: altState
+-                    key: Qt.Key_Alt
+-                }
+             }
+         }
++
++        // So we can show mnemonic underlines only while Alt is pressed
++        KeyboardIndicator.KeyState {
++            id: altState
++            key: Qt.Key_Alt
++            onPressedChanged: buttonGrid.revealedByAlt = false
++        }
++
++        // Holding Alt for a bit brings up an auto-hidden panel, to see the menus and their mnemonics (if enabled). Only
++        // on the panel that would open the menu on Alt+<letter>, the one on the active window's screen.
++        Timer {
++            id: altHoldTimer
++            interval: Plasmoid.configuration.altHoldRevealDelay
++            running: altState.pressed && Plasmoid.configuration.altHoldReveal
++            onTriggered: buttonGrid.revealedByAlt = appMenuModel.handlesActivationRequests()
++        }
++
+         Item {
+             Layout.preferredWidth: 0
+             Layout.preferredHeight: 0
+@@ -148,7 +163,7 @@
          containmentStatus: Plasmoid.containment.status
          screenGeometry: root.screenGeometry
          allScreens: Plasmoid.configuration.allScreens
@@ -203,3 +329,54 @@ diff --color -ruN a/applets/appmenu/qml/main.qml b/applets/appmenu/qml/main.qml
          Component.onCompleted: {
              Plasmoid.model = appMenuModel;
          }
+diff --color -ruN a/applets/appmenu/qml/MenuDelegate.qml b/applets/appmenu/qml/MenuDelegate.qml
+--- a/applets/appmenu/qml/MenuDelegate.qml	2026-10-31 13:34:05.876424558 -0300
++++ b/applets/appmenu/qml/MenuDelegate.qml	2026-10-31 13:35:35.103923395 -0300
+@@ -51,9 +51,35 @@
+         return MenuDelegate.State.Rest;
+     }
+ 
+-    Kirigami.MnemonicData.controlType: Kirigami.MnemonicData.SecondaryControl
++    // Underline the mnemonic, e.g. while Alt is held
++    property bool showMnemonic: false
++
++    // The app owns these mnemonics (it handles Alt+<letter> and asks us to open that menu), so underline the letter it
++    // marked with '&'. Kirigami.MnemonicData picks letters from a pool shared by all of plasmashell, where the buttons
++    // from before the last model reset (deleted later) and the global menus on other panels still hold them: labels got
++    // underlined on the wrong letter or not at all. Here it only provides the plain label, disabled to stay out of it.
++    Kirigami.MnemonicData.enabled: false
+     Kirigami.MnemonicData.label: text
+ 
++    // "&&" is a literal '&'. '&' before a letter or digit marks the mnemonic, the first one counts, like in Qt.
++    // Anything but whitespace and ASCII punctuation is taken as a letter here, QML's regexps can't do \p{L}.
++    function mnemonicRichText(label: string): string {
++        const escape = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
++        let underlined = false;
++        return label.split(/(&&|&[^\s!-\/:-@\[-`{-~])/).map(part => {
++            if (part === "&&") {
++                return "&amp;";
++            } else if (part.length === 2 && part[0] === "&") {
++                if (underlined) {
++                    return escape(part[1]);
++                }
++                underlined = true;
++                return "<u>" + escape(part[1]) + "</u>";
++            }
++            return escape(part);
++        }).join("");
++    }
++
+     topPadding: rest.margins.top
+     leftPadding: rest.margins.left
+     rightPadding: rest.margins.right
+@@ -72,8 +98,8 @@
+     }
+ 
+     contentItem: PC3.Label {
+-        text: controlRoot.Kirigami.MnemonicData.richTextLabel
+-        textFormat: Text.StyledText
++        text: controlRoot.showMnemonic ? controlRoot.mnemonicRichText(controlRoot.text) : controlRoot.Kirigami.MnemonicData.plainTextLabel
++        textFormat: controlRoot.showMnemonic ? Text.StyledText : Text.PlainText
+         verticalAlignment: Text.AlignVCenter
+         elide: Text.ElideRight
+         color: controlRoot.menuState === MenuDelegate.State.Rest ? Kirigami.Theme.textColor : Kirigami.Theme.highlightedTextColor

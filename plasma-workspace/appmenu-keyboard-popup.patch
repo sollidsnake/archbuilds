@@ -1,7 +1,17 @@
 diff --color -ruN a/applets/appmenu/appmenuapplet.cpp b/applets/appmenu/appmenuapplet.cpp
 --- a/applets/appmenu/appmenuapplet.cpp	2026-10-31 13:34:05.876347530 -0300
-+++ b/applets/appmenu/appmenuapplet.cpp	2026-10-31 13:34:05.880452256 -0300
-@@ -17,6 +17,8 @@
++++ b/applets/appmenu/appmenuapplet.cpp	2026-10-31 14:52:15.717543080 -0300
+@@ -7,6 +7,9 @@
+ #include "appmenuapplet.h"
+ #include "appmenumodel.h"
+ 
++#include <KGlobalAccel>
++#include <KLocalizedString>
++
+ #include <QAction>
+ #include <QDBusConnection>
+ #include <QDBusConnectionInterface>
+@@ -17,6 +20,8 @@
  #include <QQuickWindow>
  #include <QScreen>
  #include <QTimer>
@@ -10,7 +20,63 @@ diff --color -ruN a/applets/appmenu/appmenuapplet.cpp b/applets/appmenu/appmenua
  
  int AppMenuApplet::s_refs = 0;
  namespace
-@@ -144,6 +146,23 @@
+@@ -25,11 +30,25 @@
+ {
+     return QStringLiteral("org.kde.kappmenuview");
+ }
++
++// all global menu applets in this process and the shortcut they share, see activateOnActiveScreen()
++QList<AppMenuApplet *> s_applets;
++QAction *s_activateOnActiveScreenAction = nullptr;
+ }
+ 
+ AppMenuApplet::AppMenuApplet(QObject *parent, const KPluginMetaData &data, const QVariantList &args)
+     : Plasma::Applet(parent, data, args)
+ {
++    s_applets.append(this);
++    if (!s_activateOnActiveScreenAction) {
++        // Every applet's own shortcut has to be a different one, so with a Global Menu on each screen that's one
++        // shortcut per screen. This one opens the menu on whichever screen the active window is on.
++        s_activateOnActiveScreenAction = new QAction(i18nc("@action global shortcut", "Activate Global Menu on Active Screen"));
++        s_activateOnActiveScreenAction->setObjectName(QStringLiteral("activate global menu on active screen"));
++        KGlobalAccel::setGlobalShortcut(s_activateOnActiveScreenAction, QList<QKeySequence>());
++        connect(s_activateOnActiveScreenAction, &QAction::triggered, s_activateOnActiveScreenAction, &AppMenuApplet::activateOnActiveScreen);
++    }
++
+     ++s_refs;
+     // if we're the first, register the service
+     if (s_refs == 1) {
+@@ -61,7 +80,28 @@
+     });
+ }
+ 
+-AppMenuApplet::~AppMenuApplet() = default;
++AppMenuApplet::~AppMenuApplet()
++{
++    s_applets.removeOne(this);
++    if (s_applets.isEmpty()) {
++        // the shortcut stays configured, just inactive until there's a global menu again
++        delete s_activateOnActiveScreenAction;
++        s_activateOnActiveScreenAction = nullptr;
++    }
++}
++
++void AppMenuApplet::activateOnActiveScreen()
++{
++    // the applet that also opens the menu on the app's Alt+<mnemonic>: the one on the active window's screen
++    for (AppMenuApplet *applet : std::as_const(s_applets)) {
++        auto *model = qobject_cast<AppMenuModel *>(applet->m_model);
++        if (model && !applet->destroyed() && model->handlesActivationRequests()) {
++            // same as the applet's own shortcut
++            Q_EMIT applet->activated();
++            return;
++        }
++    }
++}
+ 
+ void AppMenuApplet::init()
+ {
+@@ -144,6 +184,23 @@
      setCurrentIndex(-1);
  }
  
@@ -34,7 +100,7 @@ diff --color -ruN a/applets/appmenu/appmenuapplet.cpp b/applets/appmenu/appmenua
  Qt::Edges edgeFromLocation(Plasma::Types::Location location)
  {
      switch (location) {
-@@ -191,7 +210,17 @@
+@@ -191,7 +248,17 @@
  
          if (view() == FullView) {
              if (!m_currentMenu) {
@@ -53,7 +119,7 @@ diff --color -ruN a/applets/appmenu/appmenuapplet.cpp b/applets/appmenu/appmenua
                  connect(m_currentMenu, &QMenu::aboutToHide, this, &AppMenuApplet::onMenuAboutToHide, Qt::UniqueConnection);
              } else if (m_sourceMenu != actionMenu) {
                  auto menuAction = m_currentMenu->menuAction();
-@@ -232,6 +261,8 @@
+@@ -232,6 +299,8 @@
          pos = QPoint(qBound(geo.x(), pos.x(), geo.x() + geo.width() - m_currentMenu->width()),
                       qBound(geo.y(), pos.y(), geo.y() + geo.height() - m_currentMenu->height()));
  
@@ -62,6 +128,17 @@ diff --color -ruN a/applets/appmenu/appmenuapplet.cpp b/applets/appmenu/appmenua
          if (view() == FullView) {
              if (m_currentMenu->isVisible()) {
                  m_currentMenu->move(pos);
+diff --color -ruN a/applets/appmenu/appmenuapplet.h b/applets/appmenu/appmenuapplet.h
+--- a/applets/appmenu/appmenuapplet.h	2026-10-31 13:34:05.876360264 -0300
++++ b/applets/appmenu/appmenuapplet.h	2026-10-31 14:52:15.717364355 -0300
+@@ -63,6 +63,7 @@
+     bool eventFilter(QObject *watched, QEvent *event) override;
+ 
+ private:
++    static void activateOnActiveScreen();
+     QMenu *createMenu(int idx) const;
+     void setCurrentIndex(int currentIndex);
+     void onMenuAboutToHide();
 diff --color -ruN a/applets/appmenu/appmenumodel.cpp b/applets/appmenu/appmenumodel.cpp
 --- a/applets/appmenu/appmenumodel.cpp	2026-10-31 13:34:05.876370384 -0300
 +++ b/applets/appmenu/appmenumodel.cpp	2026-10-31 13:34:05.880523854 -0300
@@ -172,8 +249,8 @@ diff --color -ruN a/applets/appmenu/appmenumodel.h b/applets/appmenu/appmenumode
      void bringToFocus(int index);
 diff --color -ruN a/applets/appmenu/CMakeLists.txt b/applets/appmenu/CMakeLists.txt
 --- a/applets/appmenu/CMakeLists.txt	2026-10-31 13:34:05.876323794 -0300
-+++ b/applets/appmenu/CMakeLists.txt	2026-10-31 13:34:05.880605391 -0300
-@@ -19,6 +19,7 @@
++++ b/applets/appmenu/CMakeLists.txt	2026-10-31 14:52:15.717569480 -0300
+@@ -19,13 +19,20 @@
      Qt::Widgets
      Qt::Quick
      Qt::DBus
@@ -181,7 +258,8 @@ diff --color -ruN a/applets/appmenu/CMakeLists.txt b/applets/appmenu/CMakeLists.
      Plasma::Plasma
      KF6::WindowSystem
      KF6::I18n
-@@ -26,6 +27,11 @@
++    KF6::GlobalAccel
+     PW::LibTaskManager
      dbusmenuqt
  )
  

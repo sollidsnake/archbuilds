@@ -26,6 +26,10 @@ when it's used from the keyboard on Wayland:
   their letters. It hides again when Alt is released, unless a menu got opened. Only the panel
   that would open the menu on Alt+letter shows up (the one on the active window's screen), and
   only if the window has a menu.
+- **One shortcut for the menu on the active screen.** Each applet's own shortcut has to be a
+  different key, so a Global Menu on every screen meant one shortcut per screen. Adds an
+  "Activate Global Menu on Active Screen" shortcut (System Settings → Keyboard → Shortcuts →
+  plasmashell, unset by default) that opens the menu on the active window's screen.
 
 Also fixes the `Parameter "index" is not declared` QML warning on the mnemonic path.
 

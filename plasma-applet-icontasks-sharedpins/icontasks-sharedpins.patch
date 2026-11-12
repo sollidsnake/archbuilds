@@ -1,0 +1,796 @@
+diff --color -ruN a/backend.cpp b/backend.cpp
+--- a/backend.cpp
++++ b/backend.cpp
+@@ -47,6 +47,8 @@
+ #include <processcore/process.h>
+ #include <processcore/processes.h>
+ 
++using namespace IconTasksSharedPins;
++
+ namespace KAStats = KActivities::Stats;
+ 
+ using namespace KAStats;
+diff --color -ruN a/backend.h b/backend.h
+--- a/backend.h
++++ b/backend.h
+@@ -30,6 +30,9 @@
+ class Consumer;
+ }
+ 
++namespace IconTasksSharedPins
++{
++
+ class Backend : public QObject
+ {
+     Q_OBJECT
+@@ -118,3 +121,5 @@
+     KActivityManagerdPluginsSettings m_activityManagerPluginsSettings;
+     KConfigWatcher::Ptr m_activityManagerPluginsSettingsWatcher;
+ };
++
++} // namespace IconTasksSharedPins
+diff --color -ruN a/kactivitymanagerd_plugins_settings.kcfgc b/kactivitymanagerd_plugins_settings.kcfgc
+--- a/kactivitymanagerd_plugins_settings.kcfgc
++++ b/kactivitymanagerd_plugins_settings.kcfgc
+@@ -5,3 +5,4 @@
+ ParentInConstructor=true
+ GlobalEnums=true
+ Notifiers=true
++NameSpace=IconTasksSharedPins
+diff --color -ruN a/launcherssource.cpp b/launcherssource.cpp
+--- a/launcherssource.cpp
++++ b/launcherssource.cpp
+@@ -0,0 +1,267 @@
++/*
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "launcherssource.h"
++
++#include <KLocalizedString>
++
++#include <Plasma/Containment>
++#include <Plasma/Corona>
++
++#include <QGuiApplication>
++#include <QMetaMethod>
++#include <QQmlPropertyMap>
++#include <QScreen>
++#include <QSet>
++
++using namespace Qt::StringLiterals;
++using namespace IconTasksSharedPins;
++
++namespace
++{
++bool isTaskManager(const Plasma::Applet *applet)
++{
++    const QString plugin = applet->pluginName();
++    return plugin == "org.kde.plasma.taskmanager"_L1 || plugin == "org.kde.plasma.icontasks"_L1 || plugin == "org.archbuilds.icontasks"_L1;
++}
++}
++
++LaunchersSource::LaunchersSource(QObject *parent)
++    : QObject(parent)
++{
++    m_refreshTimer.setSingleShot(true);
++    m_refreshTimer.setInterval(0);
++    connect(&m_refreshTimer, &QTimer::timeout, this, &LaunchersSource::refresh);
++}
++
++Plasma::Applet *LaunchersSource::applet() const
++{
++    return m_applet;
++}
++
++void LaunchersSource::setApplet(Plasma::Applet *applet)
++{
++    if (m_applet == applet) {
++        return;
++    }
++    m_applet = applet;
++    Q_EMIT appletChanged();
++    refresh();
++}
++
++int LaunchersSource::sourceId() const
++{
++    return m_sourceId;
++}
++
++void LaunchersSource::setSourceId(int id)
++{
++    if (m_sourceId == id) {
++        return;
++    }
++    m_sourceId = id;
++    Q_EMIT sourceIdChanged();
++    refresh();
++}
++
++Plasma::Applet *LaunchersSource::source() const
++{
++    return m_source;
++}
++
++QVariantList LaunchersSource::candidates() const
++{
++    return m_candidates;
++}
++
++void LaunchersSource::scheduleRefresh()
++{
++    m_refreshTimer.start();
++}
++
++QQmlPropertyMap *LaunchersSource::configurationOf(Plasma::Applet *applet)
++{
++    return qobject_cast<QQmlPropertyMap *>(applet->property("configuration").value<QObject *>());
++}
++
++int LaunchersSource::sourceIdOf(Plasma::Applet *applet)
++{
++    const QQmlPropertyMap *map = configurationOf(applet);
++    return map ? map->value(u"launchersSource"_s).toInt() : 0;
++}
++
++QList<Plasma::Applet *> LaunchersSource::taskManagers() const
++{
++    QList<Plasma::Applet *> result;
++    Plasma::Containment *containment = m_applet ? m_applet->containment() : nullptr;
++    Plasma::Corona *corona = containment ? containment->corona() : nullptr;
++    if (!corona) {
++        return result;
++    }
++    const auto containments = corona->containments();
++    for (Plasma::Containment *c : containments) {
++        if (c->destroyed()) {
++            continue;
++        }
++        const auto applets = c->applets();
++        for (Plasma::Applet *a : applets) {
++            if (!a->destroyed() && isTaskManager(a)) {
++                result << a;
++            }
++        }
++    }
++    return result;
++}
++
++void LaunchersSource::watchProperty(QQmlPropertyMap *map, const char *name)
++{
++    // QQmlPropertyMap::valueChanged() misses changes made from C++, the
++    // property's own notify signal doesn't.
++    const QMetaObject *mo = map->metaObject();
++    const int index = mo->indexOfProperty(name);
++    if (index >= 0 && mo->property(index).hasNotifySignal()) {
++        static const QMetaMethod slot = staticMetaObject.method(staticMetaObject.indexOfSlot("scheduleRefresh()"));
++        m_watches << connect(map, mo->property(index).notifySignal(), this, slot);
++    } else {
++        m_watches << connect(map, &QQmlPropertyMap::valueChanged, this, &LaunchersSource::scheduleRefresh);
++    }
++}
++
++QString LaunchersSource::describe(Plasma::Applet *applet) const
++{
++    Plasma::Containment *containment = applet->containment();
++
++    QString where;
++    if (containment) {
++        if (const auto type = containment->containmentType(); type == Plasma::Containment::Panel || type == Plasma::Containment::CustomPanel) {
++            switch (containment->location()) {
++            case Plasma::Types::TopEdge:
++                where = i18nc("@item:inlistbox location of a task manager", "top panel");
++                break;
++            case Plasma::Types::BottomEdge:
++                where = i18nc("@item:inlistbox location of a task manager", "bottom panel");
++                break;
++            case Plasma::Types::LeftEdge:
++                where = i18nc("@item:inlistbox location of a task manager", "left panel");
++                break;
++            case Plasma::Types::RightEdge:
++                where = i18nc("@item:inlistbox location of a task manager", "right panel");
++                break;
++            default:
++                where = i18nc("@item:inlistbox location of a task manager", "panel");
++                break;
++            }
++        } else {
++            where = i18nc("@item:inlistbox location of a task manager", "desktop");
++        }
++
++        const QRect geometry = containment->screenGeometry().toRect();
++        QString screenName;
++        if (int(containment->screen()) >= 0) {
++            const auto screens = QGuiApplication::screens();
++            for (const QScreen *screen : screens) {
++                if (screen->geometry() == geometry) {
++                    screenName = screen->name();
++                    break;
++                }
++            }
++            if (screenName.isEmpty()) {
++                screenName = QString::number(containment->screen() + 1);
++            }
++            where = i18nc("@item:inlistbox %1 is a panel or the desktop, %2 a screen name", "%1 on %2", where, screenName);
++        }
++    }
++
++    const QQmlPropertyMap *map = configurationOf(applet);
++    const int count = map ? map->value(u"launchers"_s).toStringList().size() : 0;
++
++    if (where.isEmpty()) {
++        return i18ncp("@item:inlistbox %2 is a widget name", "%2 (%1 pinned app)", "%2 (%1 pinned apps)", count, applet->title());
++    }
++    return i18ncp("@item:inlistbox %2 is a widget name, %3 where it is",
++                  "%2, %3 (%1 pinned app)",
++                  "%2, %3 (%1 pinned apps)",
++                  count,
++                  applet->title(),
++                  where);
++}
++
++void LaunchersSource::refresh()
++{
++    m_refreshTimer.stop();
++
++    for (const auto &connection : std::as_const(m_watches)) {
++        disconnect(connection);
++    }
++    m_watches.clear();
++
++    const QList<Plasma::Applet *> all = taskManagers();
++
++    if (m_applet) {
++        m_watches << connect(m_applet, &Plasma::Applet::containmentChanged, this, &LaunchersSource::scheduleRefresh);
++        if (Plasma::Containment *own = m_applet->containment()) {
++            if (Plasma::Corona *corona = own->corona()) {
++                m_watches << connect(corona, &Plasma::Corona::containmentAdded, this, &LaunchersSource::scheduleRefresh);
++                const auto containments = corona->containments();
++                for (Plasma::Containment *c : containments) {
++                    m_watches << connect(c, &Plasma::Containment::appletsChanged, this, &LaunchersSource::scheduleRefresh);
++                    m_watches << connect(c, &Plasma::Containment::screenChanged, this, &LaunchersSource::scheduleRefresh);
++                    m_watches << connect(c, &Plasma::Containment::locationChanged, this, &LaunchersSource::scheduleRefresh);
++                    m_watches << connect(c, &QObject::destroyed, this, &LaunchersSource::scheduleRefresh);
++                }
++            }
++        }
++    }
++
++    for (Plasma::Applet *a : all) {
++        m_watches << connect(a, &Plasma::Applet::destroyedChanged, this, &LaunchersSource::scheduleRefresh);
++        m_watches << connect(a, &QObject::destroyed, this, &LaunchersSource::scheduleRefresh);
++        if (QQmlPropertyMap *map = configurationOf(a)) {
++            watchProperty(map, "launchersSource");
++            if (a != m_applet) {
++                watchProperty(map, "launchers");
++            }
++        }
++    }
++
++    // Candidates: every other Task Manager.
++    QVariantList candidates;
++    for (Plasma::Applet *a : all) {
++        if (a == m_applet) {
++            continue;
++        }
++        candidates << QVariantMap{{u"value"_s, int(a->id())}, {u"text"_s, describe(a)}};
++    }
++    if (candidates != m_candidates) {
++        m_candidates = candidates;
++        Q_EMIT candidatesChanged();
++    }
++
++    // Follow the chain of sources; stop at a missing widget or a loop.
++    Plasma::Applet *resolved = nullptr;
++    if (m_applet) {
++        QSet<uint> seen{m_applet->id()};
++        int id = m_sourceId;
++        while (id > 0 && !seen.contains(uint(id))) {
++            Plasma::Applet *next = nullptr;
++            for (Plasma::Applet *a : all) {
++                if (a->id() == uint(id)) {
++                    next = a;
++                    break;
++                }
++            }
++            if (!next) {
++                break;
++            }
++            resolved = next;
++            seen.insert(next->id());
++            id = sourceIdOf(next);
++        }
++    }
++
++    if (m_source != resolved) {
++        m_source = resolved;
++        Q_EMIT sourceChanged();
++    }
++}
+diff --color -ruN a/launcherssource.h b/launcherssource.h
+--- a/launcherssource.h
++++ b/launcherssource.h
+@@ -0,0 +1,80 @@
++/*
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QObject>
++#include <QPointer>
++#include <QTimer>
++#include <QVariantList>
++
++#include <qqmlregistration.h>
++
++#include <Plasma/Applet>
++
++class QQmlPropertyMap;
++
++namespace IconTasksSharedPins
++{
++
++/*
++ * Finds the other Task Manager widgets in plasmashell and resolves the one this
++ * widget takes its pinned apps (the "launchers" setting) from.
++ */
++class LaunchersSource : public QObject
++{
++    Q_OBJECT
++    QML_ELEMENT
++
++    // The widget this object works for (Plasmoid in QML).
++    Q_PROPERTY(Plasma::Applet *applet READ applet WRITE setApplet NOTIFY appletChanged)
++    // Id of the widget to take the pinned apps from, 0 for the widget's own list.
++    Q_PROPERTY(int sourceId READ sourceId WRITE setSourceId NOTIFY sourceIdChanged)
++    // The widget whose pinned apps are shared, or null when the own list is used.
++    // Chains (A follows B, B follows C) resolve to the last widget found.
++    Q_PROPERTY(Plasma::Applet *source READ source NOTIFY sourceChanged)
++    // The other Task Manager widgets as [{ value: id, text: description }].
++    Q_PROPERTY(QVariantList candidates READ candidates NOTIFY candidatesChanged)
++
++public:
++    explicit LaunchersSource(QObject *parent = nullptr);
++
++    Plasma::Applet *applet() const;
++    void setApplet(Plasma::Applet *applet);
++
++    int sourceId() const;
++    void setSourceId(int id);
++
++    Plasma::Applet *source() const;
++    QVariantList candidates() const;
++
++Q_SIGNALS:
++    void appletChanged();
++    void sourceIdChanged();
++    void sourceChanged();
++    void candidatesChanged();
++
++private Q_SLOTS:
++    void scheduleRefresh();
++
++private:
++    void refresh();
++    QList<Plasma::Applet *> taskManagers() const;
++    void watchProperty(QQmlPropertyMap *map, const char *name);
++    QString describe(Plasma::Applet *applet) const;
++
++    static QQmlPropertyMap *configurationOf(Plasma::Applet *applet);
++    static int sourceIdOf(Plasma::Applet *applet);
++
++    QPointer<Plasma::Applet> m_applet;
++    int m_sourceId = 0;
++    QPointer<Plasma::Applet> m_source;
++    QVariantList m_candidates;
++
++    // Connections to other widgets and containments, redone on each refresh.
++    QList<QMetaObject::Connection> m_watches;
++    QTimer m_refreshTimer;
++};
++
++} // namespace IconTasksSharedPins
+diff --color -ruN a/main.xml b/main.xml
+--- a/main.xml
++++ b/main.xml
+@@ -106,6 +106,10 @@
+       <label>The list of launcher tasks on the widget. Usually .desktop file or executable URLs. Special URLs such as preferred://browser that expand to default applications are supported.</label>
+       <default>applications:systemsettings.desktop,applications:org.kde.discover.desktop,preferred://filemanager,preferred://browser</default>
+     </entry>
++    <entry name="launchersSource" type="Int">
++      <label>Id of another Task Manager widget whose launchers this widget shares. Changes made in either widget apply to both. 0 to use this widget's own list.</label>
++      <default>0</default>
++    </entry>
+     <entry name="middleClickAction" type="Enum">
+       <label>What to do on middle-mouse click on a task button.</label>
+       <choices>
+diff --color -ruN a/qml/code/LayoutMetrics.js b/qml/code/LayoutMetrics.js
+--- a/qml/code/LayoutMetrics.js
++++ b/qml/code/LayoutMetrics.js
+@@ -10,12 +10,12 @@
+ const labelMargin = Kirigami.Units.smallSpacing;
+ 
+ function horizontalMargins() {
+-    const spacingAdjustment = (tasks.plasmoid.pluginName === "org.kde.plasma.icontasks") ? tasks.plasmoid.configuration.iconSpacing : 1
++    const spacingAdjustment = (tasks.plasmoid.pluginName === "org.archbuilds.icontasks") ? tasks.plasmoid.configuration.iconSpacing : 1
+     return (taskFrame.margins.left + taskFrame.margins.right) * (tasks.vertical ? 1 : spacingAdjustment);
+ }
+ 
+ function verticalMargins() {
+-    const spacingAdjustment = (tasks.plasmoid.pluginName === "org.kde.plasma.icontasks") ? tasks.plasmoid.configuration.iconSpacing : 1
++    const spacingAdjustment = (tasks.plasmoid.pluginName === "org.archbuilds.icontasks") ? tasks.plasmoid.configuration.iconSpacing : 1
+     return (taskFrame.margins.top + taskFrame.margins.bottom) * (tasks.vertical ? spacingAdjustment : 1);
+ }
+ 
+diff --color -ruN a/qml/ConfigAppearance.qml b/qml/ConfigAppearance.qml
+--- a/qml/ConfigAppearance.qml
++++ b/qml/ConfigAppearance.qml
+@@ -17,7 +17,7 @@
+ 
+     readonly property bool plasmaPaAvailable: Qt.createComponent("PulseAudio.qml").status === Component.Ready
+     readonly property bool plasmoidVertical: Plasmoid.formFactor === PlasmaCore.Types.Vertical
+-    readonly property bool iconOnly: Plasmoid.pluginName === "org.kde.plasma.icontasks"
++    readonly property bool iconOnly: Plasmoid.pluginName === "org.archbuilds.icontasks"
+ 
+     property alias cfg_showToolTips: showToolTips.checked
+     property alias cfg_highlightWindows: highlightWindows.checked
+diff --color -ruN a/qml/ConfigBehavior.qml b/qml/ConfigBehavior.qml
+--- a/qml/ConfigBehavior.qml
++++ b/qml/ConfigBehavior.qml
+@@ -15,6 +15,7 @@
+ 
+ import org.kde.plasma.workspace.dbus as DBus
+ import org.kde.taskmanager as TaskManager
++import plasma.applet.org.archbuilds.icontasks as TaskManagerApplet
+ 
+ KCMUtils.SimpleKCM {
+     id: root
+@@ -36,6 +37,7 @@
+     property alias cfg_minimizeActiveTaskOnClick: minimizeActive.checked
+     property alias cfg_unhideOnAttention: unhideOnAttention.checked
+     property alias cfg_reverseMode: reverseMode.checked
++    property int cfg_launchersSource
+ 
+     headerPaddingEnabled: false
+     header: ColumnLayout {
+@@ -57,11 +59,62 @@
+         watchedService: "org.kde.KWin.Effect.WindowView1"
+     }
+ 
++    TaskManagerApplet.LaunchersSource {
++        id: launchersSource
++        applet: Plasmoid
++    }
++
+     Kirigami.FormLayout {
+         anchors.left: parent.left
+         anchors.right: parent.right
+ 
+         QQC2.ComboBox {
++            id: launchersSourceCombo
++            Kirigami.FormData.label: i18nc("@label:listbox", "Pinned apps:")
++            Layout.fillWidth: true
++            Layout.minimumWidth: Kirigami.Units.gridUnit * 14
++            textRole: "text"
++            valueRole: "value"
++            model: {
++                const items = [{
++                    "text": i18nc("@item:inlistbox pinned apps", "This widget's own"),
++                    "value": 0,
++                }];
++                let found = root.cfg_launchersSource === 0;
++                for (const candidate of launchersSource.candidates) {
++                    items.push({
++                        "text": i18nc("@item:inlistbox pinned apps, %1 describes another task manager", "Same as %1", candidate.text),
++                        "value": candidate.value,
++                    });
++                    found = found || candidate.value === root.cfg_launchersSource;
++                }
++                if (!found) {
++                    items.push({
++                        "text": i18nc("@item:inlistbox pinned apps", "Same as a removed widget (uses this widget's own)"),
++                        "value": root.cfg_launchersSource,
++                    });
++                }
++                return items;
++            }
++            onModelChanged: currentIndex = indexOfValue(root.cfg_launchersSource)
++            onActivated: root.cfg_launchersSource = currentValue
++            Component.onCompleted: currentIndex = indexOfValue(root.cfg_launchersSource)
++        }
++
++        QQC2.Label {
++            Layout.fillWidth: true
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 20
++            visible: launchersSourceCombo.currentValue !== 0
++            wrapMode: Text.Wrap
++            font: Kirigami.Theme.smallFont
++            text: i18nc("@info", "Pinning, unpinning and moving apps in either widget changes both. This widget's previous list is replaced.")
++        }
++
++        Item {
++            Kirigami.FormData.isSection: true
++        }
++
++        QQC2.ComboBox {
+             id: groupingStrategy
+             Kirigami.FormData.label: i18nc("@label:listbox how to group tasks", "Group:")
+             Layout.fillWidth: true
+@@ -104,14 +157,14 @@
+ 
+         QQC2.CheckBox {
+             id: groupPopups
+-            visible: (Plasmoid.pluginName !== "org.kde.plasma.icontasks")
++            visible: (Plasmoid.pluginName !== "org.archbuilds.icontasks")
+             text: i18nc("@option:check grouped task", "Combine into single button")
+             enabled: groupingStrategy.currentIndex > 0
+         }
+ 
+         QQC2.CheckBox {
+             id: onlyGroupWhenFull
+-            visible: (Plasmoid.pluginName !== "org.kde.plasma.icontasks")
++            visible: (Plasmoid.pluginName !== "org.archbuilds.icontasks")
+             text: i18nc("@option:check grouped task","Group only when the Task Manager is full")
+             enabled: groupingStrategy.currentIndex > 0 && groupPopups.checked
+             Accessible.onPressAction: toggle()
+@@ -119,7 +172,7 @@
+ 
+         Item {
+             Kirigami.FormData.isSection: true
+-            visible: (Plasmoid.pluginName !== "org.kde.plasma.icontasks")
++            visible: (Plasmoid.pluginName !== "org.archbuilds.icontasks")
+         }
+ 
+         QQC2.ComboBox {
+@@ -161,20 +214,20 @@
+ 
+         QQC2.CheckBox {
+             id: separateLaunchers
+-            visible: (Plasmoid.pluginName !== "org.kde.plasma.icontasks")
++            visible: (Plasmoid.pluginName !== "org.archbuilds.icontasks")
+             text: i18nc("@option:check configure task sorting", "Keep launchers separate")
+             enabled: sortingStrategy.currentValue === TaskManager.TasksModel.SortManual
+         }
+ 
+         QQC2.CheckBox {
+             id: hideLauncherOnStart
+-            visible: (Plasmoid.pluginName !== "org.kde.plasma.icontasks")
++            visible: (Plasmoid.pluginName !== "org.archbuilds.icontasks")
+             text: i18nc("@option:check for icons-and-text task manager", "Hide launchers after application startup")
+         }
+ 
+         Item {
+             Kirigami.FormData.isSection: true
+-            visible: (Plasmoid.pluginName !== "org.kde.plasma.icontasks")
++            visible: (Plasmoid.pluginName !== "org.archbuilds.icontasks")
+         }
+ 
+         QQC2.CheckBox {
+diff --color -ruN a/qml/ContextMenu.qml b/qml/ContextMenu.qml
+--- a/qml/ContextMenu.qml
++++ b/qml/ContextMenu.qml
+@@ -14,7 +14,7 @@
+ 
+ import org.kde.taskmanager as TaskManager
+ import org.kde.plasma.private.mpris as Mpris
+-import plasma.applet.org.kde.plasma.taskmanager as TaskManagerApplet
++import plasma.applet.org.archbuilds.icontasks as TaskManagerApplet
+ 
+ PlasmaExtras.Menu {
+     id: menu
+diff --color -ruN a/qml/GroupDialog.qml b/qml/GroupDialog.qml
+--- a/qml/GroupDialog.qml
++++ b/qml/GroupDialog.qml
+@@ -13,7 +13,7 @@
+ import org.kde.plasma.components as PlasmaComponents3
+ import org.kde.kirigami as Kirigami
+ import org.kde.plasma.plasmoid
+-import plasma.applet.org.kde.plasma.taskmanager as TaskManagerApplet
++import plasma.applet.org.archbuilds.icontasks as TaskManagerApplet
+ 
+ PlasmaCore.PopupPlasmaWindow {
+     id: groupDialog
+diff --color -ruN a/qml/main.qml b/qml/main.qml
+--- a/qml/main.qml
++++ b/qml/main.qml
+@@ -18,7 +18,7 @@
+ import org.kde.plasma.workspace.trianglemousefilter
+ 
+ import org.kde.taskmanager as TaskManager
+-import plasma.applet.org.kde.plasma.taskmanager as TaskManagerApplet
++import plasma.applet.org.archbuilds.icontasks as TaskManagerApplet
+ import org.kde.plasma.workspace.dbus as DBus
+ 
+ PlasmoidItem {
+@@ -32,7 +32,7 @@
+ 
+     readonly property bool shouldShrinkToZero: tasksModel.count === 0
+     readonly property bool vertical: Plasmoid.formFactor === PlasmaCore.Types.Vertical
+-    readonly property bool iconsOnly: Plasmoid.pluginName === "org.kde.plasma.icontasks"
++    readonly property bool iconsOnly: Plasmoid.pluginName === "org.archbuilds.icontasks"
+ 
+     property Task toolTipOpenedByClick
+     property Task toolTipAreaItem
+@@ -189,6 +189,7 @@
+ 
+         onLauncherListChanged: {
+             Plasmoid.configuration.launchers = launcherList;
++            tasks.pushSharedLaunchers(launcherList);
+         }
+ 
+         onGroupingAppIdBlacklistChanged: {
+@@ -238,6 +239,41 @@
+         }
+     }
+ 
++    // Pinned apps shared with another Task Manager (launchersSource setting).
++    readonly property TaskManagerApplet.LaunchersSource launchersSource: TaskManagerApplet.LaunchersSource {
++        applet: Plasmoid
++        sourceId: Plasmoid.configuration.launchersSource
++    }
++
++    // The other widget's list; this widget's own list is kept as a copy of it,
++    // so it stays when the widget stops sharing.
++    readonly property var sharedLaunchers: launchersSource.source?.configuration.launchers ?? null
++
++    onSharedLaunchersChanged: {
++        if (sharedLaunchers !== null && !sameStringList(sharedLaunchers, Plasmoid.configuration.launchers)) {
++            Plasmoid.configuration.launchers = sharedLaunchers;
++        }
++    }
++
++    function sameStringList(a: var, b: var): bool {
++        if (a.length !== b.length) {
++            return false;
++        }
++        for (let i = 0; i < a.length; ++i) {
++            if (a[i] !== b[i]) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    function pushSharedLaunchers(list: var): void {
++        const source = launchersSource.source;
++        if (source && !sameStringList(source.configuration.launchers, list)) {
++            source.configuration.launchers = list;
++        }
++    }
++
+     readonly property TaskManagerApplet.Backend backend: TaskManagerApplet.Backend {
+         id: backend
+ 
+diff --color -ruN a/qml/MouseHandler.qml b/qml/MouseHandler.qml
+--- a/qml/MouseHandler.qml
++++ b/qml/MouseHandler.qml
+@@ -8,7 +8,7 @@
+ 
+ import org.kde.taskmanager as TaskManager
+ import org.kde.plasma.plasmoid
+-import plasma.applet.org.kde.plasma.taskmanager as TaskManagerApplet
++import plasma.applet.org.archbuilds.icontasks as TaskManagerApplet
+ 
+ DropArea {
+     id: dropArea
+diff --color -ruN a/qml/TaskBadgeOverlay.qml b/qml/TaskBadgeOverlay.qml
+--- a/qml/TaskBadgeOverlay.qml
++++ b/qml/TaskBadgeOverlay.qml
+@@ -15,7 +15,7 @@
+     readonly property bool verySmallIcon:
+         icon.width < Kirigami.Units.iconSizes.smallMedium ||
+         icon.height < Kirigami.Units.iconSizes.smallMedium
+-    readonly property bool shiftBadgeDown: (Plasmoid.pluginName === "org.kde.plasma.icontasks") && task.audioStreamIcon !== null
++    readonly property bool shiftBadgeDown: (Plasmoid.pluginName === "org.archbuilds.icontasks") && task.audioStreamIcon !== null
+     readonly property int badgeMaskY: shiftBadgeDown ? root.height - badgeRect.height : 0
+     readonly property int offset: Math.round(Math.max(Kirigami.Units.smallSpacing / 2, badgeMask.width / 32))
+     readonly property int extraHorizontalOffset: verySmallIcon && badgeRect.text.length > 2 ? -2 : 0
+diff --color -ruN a/qml/TaskList.qml b/qml/TaskList.qml
+--- a/qml/TaskList.qml
++++ b/qml/TaskList.qml
+@@ -9,7 +9,7 @@
+ 
+ import org.kde.plasma.plasmoid
+ import org.kde.plasma.core as PlasmaCore
+-import plasma.applet.org.kde.plasma.taskmanager as TaskManagerApplet
++import plasma.applet.org.archbuilds.icontasks as TaskManagerApplet
+ 
+ GridLayout {
+     property bool animating: false
+diff --color -ruN a/qml/TaskProgressOverlay.qml b/qml/TaskProgressOverlay.qml
+--- a/qml/TaskProgressOverlay.qml
++++ b/qml/TaskProgressOverlay.qml
+@@ -10,7 +10,7 @@
+ import org.kde.ksvg as KSvg
+ import org.kde.plasma.plasmoid
+ 
+-import plasma.applet.org.kde.plasma.taskmanager as TaskManagerApplet
++import plasma.applet.org.archbuilds.icontasks as TaskManagerApplet
+ 
+ T.ProgressBar {
+     id: control
+diff --color -ruN a/qml/Task.qml b/qml/Task.qml
+--- a/qml/Task.qml
++++ b/qml/Task.qml
+@@ -15,7 +15,7 @@
+ import org.kde.plasma.extras as PlasmaExtras
+ import org.kde.plasma.components as PlasmaComponents3
+ import org.kde.kirigami as Kirigami
+-import plasma.applet.org.kde.plasma.taskmanager as TaskManagerApplet
++import plasma.applet.org.archbuilds.icontasks as TaskManagerApplet
+ import org.kde.plasma.plasmoid
+ 
+ import org.kde.taskmanager as TaskManager
+@@ -238,7 +238,7 @@
+ 
+     onSmartLauncherEnabledChanged: {
+         if (smartLauncherEnabled && !smartLauncherItem) {
+-            const component = Qt.createComponent("plasma.applet.org.kde.plasma.taskmanager", "SmartLauncherItem");
++            const component = Qt.createComponent("plasma.applet.org.archbuilds.icontasks", "SmartLauncherItem");
+             const smartLauncher = component.createObject(task);
+             component.destroy();
+ 
+diff --color -ruN a/smartlauncherbackend.cpp b/smartlauncherbackend.cpp
+--- a/smartlauncherbackend.cpp
++++ b/smartlauncherbackend.cpp
+@@ -21,7 +21,7 @@
+ #include "log_settings.h"
+ #include <settings.h>
+ 
+-using namespace SmartLauncher;
++using namespace IconTasksSharedPins::SmartLauncher;
+ using namespace NotificationManager;
+ 
+ Backend::Backend(QObject *parent)
+diff --color -ruN a/smartlauncherbackend.h b/smartlauncherbackend.h
+--- a/smartlauncherbackend.h
++++ b/smartlauncherbackend.h
+@@ -21,6 +21,9 @@
+ class Settings;
+ }
+ 
++namespace IconTasksSharedPins
++{
++
+ namespace SmartLauncher
+ {
+ struct Entry {
+@@ -118,3 +121,5 @@
+ };
+ 
+ } // namespace SmartLauncher
++
++} // namespace IconTasksSharedPins
+diff --color -ruN a/smartlauncheritem.cpp b/smartlauncheritem.cpp
+--- a/smartlauncheritem.cpp
++++ b/smartlauncheritem.cpp
+@@ -11,7 +11,7 @@
+ 
+ #include "log_settings.h"
+ 
+-using namespace SmartLauncher;
++using namespace IconTasksSharedPins::SmartLauncher;
+ 
+ Item::Item(QObject *parent)
+     : QObject(parent)
+diff --color -ruN a/smartlauncheritem.h b/smartlauncheritem.h
+--- a/smartlauncheritem.h
++++ b/smartlauncheritem.h
+@@ -13,6 +13,9 @@
+ 
+ #include "smartlauncherbackend.h"
+ 
++namespace IconTasksSharedPins
++{
++
+ namespace SmartLauncher
+ {
+ 
+@@ -80,3 +83,5 @@
+ };
+ 
+ } // namespace SmartLauncher
++
++} // namespace IconTasksSharedPins

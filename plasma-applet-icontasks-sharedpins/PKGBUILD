@@ -1,0 +1,62 @@
+pkgname=plasma-applet-icontasks-sharedpins
+_srcname=plasma-desktop
+pkgver=6.8.2
+pkgrel=1
+pkgdesc='Icons-Only Task Manager widget that can share its pinned apps with another task manager'
+arch=(x86_64)
+url='https://invent.kde.org/plasma/plasma-desktop'
+license=(GPL-2.0-or-later)
+# Uses plasma-workspace's private libraries and QML modules: rebuild after every Plasma update.
+depends=(glibc
+         gcc-libs
+         kconfig
+         kcoreaddons
+         kglobalaccel
+         ki18n
+         kio
+         knotifications
+         kservice
+         kwindowsystem
+         kxmlgui
+         libksysguard
+         libplasma
+         plasma-activities
+         plasma-activities-stats
+         "plasma-workspace>=${pkgver%.*}"
+         qt6-base
+         qt6-declarative)
+makedepends=(extra-cmake-modules)
+source=(https://download.kde.org/stable/plasma/$pkgver/$_srcname-$pkgver.tar.xz{,.sig}
+        icontasks-sharedpins.patch
+        CMakeLists.txt
+        metadata.json)
+sha256sums=('fff6177d217e60ab747cb34e35ef249afab41c72bbd5ea61d3471ef88864bd80'
+            'SKIP'
+            'a9f271e60f2fb97737af0d8c7d12354bf8b49c8915694f84b5b447e89ae631fb'
+            'ebe6c72043b16ab57d5bb91b585689a5c4a064e9b3be6eea8632fec177fa8d5f'
+            '21794097cc9d0c7dd89106cd7abe386024a45f49c6ae6ef90876db25f9c6fe79')
+validpgpkeys=('E0A3EB202F8E57528E13E72FD7574483BB57B18D'  # Jonathan Esk-Riddell <jr@jriddell.org>
+              '0AAC775BB6437A8D9AF7A3ACFE0784117FBCE11D'  # Bhushan Shah <bshah@kde.org>
+              'D07BD8662C56CB291B316EB2F5675605C74E02CF'  # David Edmundson <davidedmundson@kde.org>
+              '1FA881591C26B276D7A5518EEAAF29B42A678C20') # Marco Martin <notmart@gmail.com>
+
+prepare() {
+  # Only the task manager widget, plus the settings file it borrows from the Recent Files KCM.
+  rm -rf applet
+  cp -r $_srcname-$pkgver/applets/taskmanager applet
+  rm applet/CMakeLists.txt applet/metadata.json applet/Messages.sh
+  cp $_srcname-$pkgver/kcms/recentFiles/kactivitymanagerd_plugins_settings.kcfg{,c} applet/
+  patch -d applet -p1 < icontasks-sharedpins.patch
+  cp CMakeLists.txt metadata.json applet/
+}
+
+build() {
+  cmake -B build -S applet \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DBUILD_TESTING=OFF
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+}
